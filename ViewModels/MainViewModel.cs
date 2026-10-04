@@ -995,6 +995,99 @@ public partial class MainViewModel : ObservableObject
             ? Task.FromResult(0)
             : gmail.GetFolderThreadCountAsync(folder.Id, cancellationToken);
 
+    public Task<int> GetTrashMessageCountAsync(CancellationToken cancellationToken = default) =>
+        !IsConnected
+            ? Task.FromResult(0)
+            : gmail.GetFolderMessageCountAsync("TRASH", cancellationToken);
+
+    public async Task EmptyTrashAsync()
+    {
+        if (!IsConnected || IsBusy)
+        {
+            return;
+        }
+
+        IsBusy = true;
+        SyncStatusText = "Waiting for permanent-delete permission";
+        SyncStatusDetail = "Google may ask you to approve full Gmail access for this destructive action.";
+        SyncGlyph = "\uE895";
+        try
+        {
+            var result = await gmail.EmptyTrashAsync(
+                (completed, total) =>
+                {
+                    SyncStatusText = total == 0
+                        ? "Trash is already empty"
+                        : $"Permanently deleting Trash ({completed}/{total})";
+                    SyncStatusDetail = total == 0
+                        ? "Gmail reported no messages in Trash."
+                        : "Deleted messages cannot be recovered.";
+                },
+                CancellationToken.None);
+
+            await ReconcileTrashCacheAsync(clearOnFetchFailure: result.RemainingCount == 0);
+            SelectedThread = null;
+            SelectedThreadDetail = null;
+            await RefreshAsync(CancellationToken.None);
+            SyncStatusText = result.RemainingCount == 0
+                ? "Trash emptied"
+                : "Trash changed while emptying";
+            SyncStatusDetail = result.RemainingCount == 0
+                ? $"Permanently deleted {result.DeletedCount:N0} message{(result.DeletedCount == 1 ? string.Empty : "s")} from Gmail."
+                : $"Deleted {result.DeletedCount:N0}; skipped {result.SkippedCount:N0} restored message{(result.SkippedCount == 1 ? string.Empty : "s")}; {result.RemainingCount:N0} newer message{(result.RemainingCount == 1 ? string.Empty : "s")} remain in Trash.";
+            SyncGlyph = "\uE73E";
+        }
+        catch (Exception ex)
+        {
+            await ReconcileTrashCacheAsync(clearOnFetchFailure: true);
+            SyncStatusText = "Empty Trash stopped";
+            SyncStatusDetail = $"Some batches may already have been permanently deleted. {UserFacingError(ex)}";
+            SyncGlyph = "\uEA39";
+            throw;
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    private async Task ReconcileTrashCacheAsync(bool clearOnFetchFailure)
+    {
+        IReadOnlyList<MailThreadSummary> currentTrash = [];
+        try
+        {
+            using var reconciliationCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            currentTrash = await gmail.GetThreadsAsync(
+                "TRASH",
+                query: null,
+                cancellationToken: reconciliationCancellation.Token);
+        }
+        catch
+        {
+            // Trash is a disposable mirror. Clearing stale membership is safer
+            // than presenting messages that may already be permanently gone.
+            if (!clearOnFetchFailure)
+            {
+                return;
+            }
+        }
+
+        try
+        {
+            await localStore.SaveFolderSnapshotAsync("TRASH", currentTrash, reconcileMissing: true);
+            if (SelectedFolder?.Id == "TRASH")
+            {
+                ReplaceThreads(currentTrash);
+                SelectedThread = null;
+                SelectedThreadDetail = null;
+            }
+        }
+        catch
+        {
+            // Preserve the original Gmail error shown to the user.
+        }
+    }
+
     public async Task DeleteFolderAndTrashContentsAsync(MailFolder folder)
     {
         if (!folder.CanDelete || !IsConnected)

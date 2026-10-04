@@ -186,6 +186,11 @@ public sealed record MailThreadDetail(
 
 public sealed record GmailAccountProfile(string EmailAddress, ulong HistoryId);
 
+public sealed record EmptyTrashResult(
+    int DeletedCount,
+    int SkippedCount,
+    int RemainingCount);
+
 public sealed record MailAttachmentInput(
     string FileName,
     byte[] Content,

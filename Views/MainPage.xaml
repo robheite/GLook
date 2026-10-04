@@ -16,6 +16,7 @@
    <MenuFlyoutItem x:Name="ContextNewSubfolderItem" Click="NewSubfolder_Click" Text="New subfolder"/>
    <MenuFlyoutItem x:Name="ContextRenameFolderItem" Click="RenameFolder_Click" Text="Rename label"/>
    <MenuFlyoutItem x:Name="ContextDeleteFolderItem" Click="DeleteContextFolder_Click" Text="Delete label"/>
+   <MenuFlyoutItem x:Name="ContextEmptyTrashItem" Click="EmptyTrash_Click" Text="Empty Trash…" Visibility="Collapsed"/>
    <MenuFlyoutSeparator/>
    <MenuFlyoutItem x:Name="ContextExpandBranchItem" Click="ExpandFolderBranch_Click" Text="Expand branch"/>
    <MenuFlyoutItem x:Name="ContextCollapseBranchItem" Click="CollapseFolderBranch_Click" Text="Collapse branch"/>

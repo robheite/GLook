@@ -16,21 +16,26 @@ namespace GLook.Services;
 
 public sealed class GmailClientService
 {
+    private const int PermanentDeleteBatchSize = 50;
+    private static readonly TimeSpan PermanentDeleteBatchDelay = TimeSpan.FromSeconds(12);
     private const string UserId = "me";
     private const string CredentialKey = "primary-account";
     private const string SettingsCredentialKey = "signature-settings";
+    private const string PermanentDeleteCredentialKey = "permanent-delete";
     private const string ClientSecretsKey = "oauth-client-secrets";
     private const string EmbeddedClientResourceName = "GLook.GoogleOAuthClient";
     private const string BodySizeOmissionMarker = "[Message body omitted because it exceeds GLook's 8 MB display limit.]";
     private const string MimeStructureOmissionMarker = "[Message body omitted because its MIME structure exceeds GLook's safety limits.]";
     private static readonly string[] Scopes = [GmailService.Scope.GmailModify];
     private static readonly string[] SettingsScopes = [GmailService.Scope.GmailSettingsBasic];
+    private static readonly string[] PermanentDeleteScopes = [GmailService.Scope.MailGoogleCom];
     private readonly EncryptedDataStore secureStore;
     private readonly SemaphoreSlim labelCountRefreshGate = new(1, 1);
     private Dictionary<string, LabelUnreadCounts> labelUnreadCounts = new(StringComparer.Ordinal);
     private DateTimeOffset labelUnreadCountsExpiresAt = DateTimeOffset.MinValue;
     private GmailService? gmail;
     private GmailService? gmailSettings;
+    private GmailService? gmailPermanentDelete;
     private string? connectedEmailAddress;
 
     public GmailClientService(EncryptedDataStore secureStore)
@@ -568,6 +573,145 @@ public sealed class GmailClientService
         return (int)(label.ThreadsTotal ?? 0);
     }
 
+    public async Task<int> GetFolderMessageCountAsync(
+        string labelId,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(labelId);
+        var label = await RequireClient().Users.Labels.Get(UserId, labelId)
+            .ExecuteAsync(cancellationToken);
+        return (int)(label.MessagesTotal ?? 0);
+    }
+
+    public async Task<EmptyTrashResult> EmptyTrashAsync(
+        Action<int, int>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        var service = await EnsurePermanentDeleteClientAsync(cancellationToken);
+        var ids = (await ListTrashMessageIdsAsync(service, cancellationToken)).ToList();
+        progress?.Invoke(0, ids.Count);
+        var deleted = 0;
+        var skipped = 0;
+        var batches = ids.Chunk(PermanentDeleteBatchSize).ToArray();
+        for (var batchIndex = 0; batchIndex < batches.Length; batchIndex++)
+        {
+            var batch = batches[batchIndex];
+            // Gmail's batchDelete endpoint cannot condition deletion on a label.
+            // Re-read each small batch immediately before deletion to narrow the
+            // unavoidable check/delete race and skip mail already restored elsewhere.
+            var confirmedBatch = await FilterMessagesStillInTrashAsync(
+                service,
+                batch,
+                cancellationToken);
+            skipped += batch.Length - confirmedBatch.Length;
+            if (confirmedBatch.Length == 0)
+            {
+                progress?.Invoke(deleted + skipped, ids.Count);
+            }
+            else
+            {
+                await ExecuteWithQuotaRetryAsync(
+                    async () =>
+                    {
+                        await service.Users.Messages.BatchDelete(
+                                new BatchDeleteMessagesRequest { Ids = confirmedBatch },
+                                UserId)
+                            .ExecuteAsync(cancellationToken);
+                        return true;
+                    },
+                    null,
+                    cancellationToken);
+                deleted += confirmedBatch.Length;
+                progress?.Invoke(deleted + skipped, ids.Count);
+            }
+
+            // Fifty metadata reads plus one batchDelete consume about 1,050
+            // Gmail quota units. Pacing keeps the operation below the current
+            // 6,000-unit per-user/minute limit with room for normal sync calls.
+            if (batchIndex < batches.Length - 1)
+            {
+                var jitter = TimeSpan.FromMilliseconds(Random.Shared.Next(0, 1001));
+                await Task.Delay(PermanentDeleteBatchDelay + jitter, cancellationToken);
+            }
+        }
+
+        var remaining = (await ListTrashMessageIdsAsync(service, cancellationToken)).Count;
+        InvalidateLabelUnreadCounts();
+        return new EmptyTrashResult(deleted, skipped, remaining);
+    }
+
+    private async Task<string[]> FilterMessagesStillInTrashAsync(
+        GmailService service,
+        IReadOnlyCollection<string> messageIds,
+        CancellationToken cancellationToken)
+    {
+        using var throttle = new SemaphoreSlim(10);
+        var checks = messageIds.Select(async messageId =>
+        {
+            await throttle.WaitAsync(cancellationToken);
+            try
+            {
+                try
+                {
+                    var request = service.Users.Messages.Get(UserId, messageId);
+                    request.Format = UsersResource.MessagesResource.GetRequest.FormatEnum.Minimal;
+                    var message = await ExecuteWithQuotaRetryAsync(
+                        () => request.ExecuteAsync(cancellationToken),
+                        null,
+                        cancellationToken);
+                    return message.LabelIds?.Contains("TRASH", StringComparer.Ordinal) == true
+                        ? messageId
+                        : null;
+                }
+                catch (GoogleApiException ex) when (ex.HttpStatusCode == HttpStatusCode.NotFound)
+                {
+                    return null;
+                }
+            }
+            finally
+            {
+                throttle.Release();
+            }
+        });
+
+        return (await Task.WhenAll(checks))
+            .Where(messageId => messageId is not null)
+            .Select(messageId => messageId!)
+            .ToArray();
+    }
+
+    private async Task<HashSet<string>> ListTrashMessageIdsAsync(
+        GmailService service,
+        CancellationToken cancellationToken)
+    {
+        var messageIds = new HashSet<string>(StringComparer.Ordinal);
+        string? pageToken = null;
+        do
+        {
+            var list = service.Users.Messages.List(UserId);
+            list.LabelIds = new[] { "TRASH" };
+            list.IncludeSpamTrash = true;
+            list.MaxResults = 500;
+            list.PageToken = pageToken;
+            var page = await ExecuteWithQuotaRetryAsync(
+                () => list.ExecuteAsync(cancellationToken),
+                null,
+                cancellationToken);
+            foreach (var message in page.Messages ?? [])
+            {
+                if (!string.IsNullOrWhiteSpace(message.Id))
+                {
+                    messageIds.Add(message.Id);
+                }
+            }
+
+            pageToken = page.NextPageToken;
+        }
+        while (!string.IsNullOrWhiteSpace(pageToken));
+
+        return messageIds;
+    }
+
     public async Task<IReadOnlyList<string>> TrashFolderThreadsAsync(
         string labelId,
         Action<int, int>? progress = null,
@@ -768,6 +912,8 @@ public sealed class GmailClientService
         gmail = null;
         gmailSettings?.Dispose();
         gmailSettings = null;
+        gmailPermanentDelete?.Dispose();
+        gmailPermanentDelete = null;
         connectedEmailAddress = null;
         labelUnreadCounts.Clear();
         labelUnreadCountsExpiresAt = DateTimeOffset.MinValue;
@@ -802,6 +948,55 @@ public sealed class GmailClientService
             ApplicationName = "GLook"
         });
         return gmailSettings;
+    }
+
+    private async Task<GmailService> EnsurePermanentDeleteClientAsync(CancellationToken cancellationToken)
+    {
+        if (gmailPermanentDelete is not null)
+        {
+            return gmailPermanentDelete;
+        }
+
+        var clientJson = LoadPackagedClientSecrets()
+            ?? await secureStore.GetAsync<string>(ClientSecretsKey);
+        if (string.IsNullOrWhiteSpace(clientJson))
+        {
+            throw new InvalidOperationException("This build does not contain a Google OAuth client configuration.");
+        }
+
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes(clientJson));
+        var secrets = GoogleClientSecrets.FromStream(stream).Secrets;
+        var credential = await GoogleWebAuthorizationBroker.AuthorizeAsync(
+            secrets,
+            PermanentDeleteScopes,
+            PermanentDeleteCredentialKey,
+            cancellationToken,
+            secureStore);
+        var candidate = new GmailService(new BaseClientService.Initializer
+        {
+            HttpClientInitializer = credential,
+            ApplicationName = "GLook"
+        });
+        var profile = await candidate.Users.GetProfile(UserId).ExecuteAsync(cancellationToken);
+        if (!string.Equals(profile.EmailAddress, connectedEmailAddress, StringComparison.OrdinalIgnoreCase))
+        {
+            candidate.Dispose();
+            try
+            {
+                await credential.RevokeTokenAsync(CancellationToken.None);
+            }
+            catch
+            {
+                // The local credential is still removed below even if Google cannot be reached.
+            }
+
+            await secureStore.DeleteAsync<object>(PermanentDeleteCredentialKey);
+            throw new InvalidOperationException(
+                $"The permanent-delete permission was granted for {profile.EmailAddress}, but GLook is connected to {connectedEmailAddress}. Try Empty Trash again and choose the connected account.");
+        }
+
+        gmailPermanentDelete = candidate;
+        return gmailPermanentDelete;
     }
 
     private GmailService RequireClient() =>
@@ -1305,7 +1500,8 @@ public sealed class GmailClientService
             }
             catch (GoogleApiException ex) when (IsQuotaLimit(ex) && attempt < retryDelays.Length)
             {
-                var delay = retryDelays[attempt];
+                var delay = retryDelays[attempt]
+                    + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 1001));
                 status?.Invoke(
                     $"Gmail is temporarily limiting sync requests. Retrying in {delay.TotalSeconds:0} seconds.");
                 await Task.Delay(delay, cancellationToken);

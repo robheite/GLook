@@ -27,6 +27,7 @@ The first working slice includes:
 - archive, Trash, read/unread, star/unstar, Spam, add/remove labels, and folder-style moves;
 - opening an unread conversation marks it read in Gmail;
 - Delete moves the conversation to Gmail Trash;
+- right-clicking Gmail Trash exposes **Empty Trash…**, which shows the live message count and requires explicit confirmation before permanent deletion;
 - DPAPI-encrypted SQLite cache for recent conversation summaries and offline fallback;
 - true nested label navigation with preserved expansion and scroll position;
 - Windows new-mail notifications while GLook is running, with a test control and configurable automatic sync (five minutes by default);
@@ -53,6 +54,8 @@ Official references:
 - [Enable Google Workspace APIs](https://developers.google.com/workspace/guides/enable-apis)
 
 OAuth user tokens are encrypted under `%LOCALAPPDATA%\GLook\secure` with Windows DPAPI. Disconnecting from GLook removes that encrypted session from the PC without changing Gmail.
+
+Normal mail operations use the narrower `gmail.modify` permission. Gmail requires the full `mail.google.com` scope for immediate permanent deletion, so GLook requests and stores that separate encrypted permission only after the user confirms **Empty Trash** for the first time. The authorized Google profile must match the account already connected to GLook.
 
 ## Build and run
 
@@ -103,7 +106,7 @@ For an explicitly mutating integration check, `--self-test-label-lifecycle` crea
 
 ## Context menus
 
-Right-click a folder or label to open it, create a nested label, rename or delete a user label, expand or collapse one branch or the full tree, or sync the selected folder. Gmail system folders remain protected. Before deleting a user label, GLook checks Gmail directly. An empty label can be deleted immediately; a non-empty label requires explicit confirmation that every contained conversation will be moved to Gmail Trash before the label is removed.
+Right-click a folder or label to open it, create a nested label, rename or delete a user label, expand or collapse one branch or the full tree, or sync the selected folder. Gmail system folders remain protected. Before deleting a user label, GLook checks Gmail directly. An empty label can be deleted immediately; a non-empty label requires explicit confirmation that every contained conversation will be moved to Gmail Trash before the label is removed. Right-click Gmail Trash for **Empty Trash…**; GLook shows the current message count and requires a second destructive-action confirmation before calling Gmail's permanent-delete API.
 
 Right-click a conversation for state-aware mail actions: open, reply, reply all, forward, archive, move to Trash, restore from Trash, read or unread, star or unstar, move, apply labels, spam or not spam, and open the conversation in Gmail.
 
@@ -122,6 +125,7 @@ GLook registers with the Windows app notification system and automatically refre
 | Delete a non-empty user folder | Confirms the live conversation count, moves every contained thread to Gmail Trash, then deletes the label |
 | Open an unread conversation | Removes the Gmail `UNREAD` label |
 | Delete a conversation | Moves the Gmail thread to Trash on all devices |
+| Empty Trash | Permanently deletes every message currently carrying Gmail's Trash label after confirmation; this cannot be undone |
 | Archive a conversation | Removes the Gmail `INBOX` label |
 | Mark as Spam | Applies Gmail Spam behavior to the whole conversation |
 | Move to a folder | Adds the target user label or Inbox and removes the current folder label when appropriate |

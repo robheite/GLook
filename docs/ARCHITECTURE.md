@@ -39,7 +39,7 @@ Mutations are deliberately conservative:
 - archive removes `INBOX`, Spam uses Gmail's `SPAM` label behavior, and star/read state applies to the conversation;
 - folder-style Move is limited to Inbox and user-created labels; dedicated commands handle Trash and Spam;
 - compose creates RFC-compliant MIME through MimeKit, saved drafts use Gmail draft IDs, and saved drafts are sent atomically through `drafts.send`;
-- permanent deletion is not implemented.
+- permanent deletion is isolated to the Trash folder's explicit **Empty Trash** command, requires a second confirmation, and uses a separately authorized `mail.google.com` client because Gmail does not permit permanent deletion with `gmail.modify`;
 
 ## Synchronization boundary
 
@@ -61,7 +61,7 @@ While GLook is running, a configurable automatic-sync timer (five minutes by def
 
 1. **Incremental sync** — persist Gmail `historyId`, consume history deltas, reconcile external deletes and label changes, paginate older mail, and add a durable offline mutation queue with idempotency keys.
 2. **Background experience** — closed-app synchronization, unread badge, startup options, and explicit network/backoff states.
-3. **Mail productivity** — reopen existing drafts, bulk selection, snooze, importance, signatures, rules, attachment download, and permanent deletion from Trash.
+3. **Mail productivity** — reopen existing drafts, snooze, importance, rules, and attachment download.
 4. **Productization** — multiple simultaneous accounts, installer/update channel, diagnostics export, accessibility audit, localization, and Google OAuth verification for distribution.
 
 Each slice should preserve the same rule: retained local state is a cache with provenance, while Gmail remains the mailbox of record.

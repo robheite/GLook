@@ -249,6 +249,10 @@ public sealed partial class MainPage : Page
         ContextNewSubfolderItem.IsEnabled = ViewModel.IsConnected && isUserLabelPath;
         ContextRenameFolderItem.IsEnabled = ViewModel.IsConnected && folder?.CanDelete == true;
         ContextDeleteFolderItem.IsEnabled = ViewModel.IsConnected && folder?.CanDelete == true;
+        ContextEmptyTrashItem.Visibility = folder?.Id == "TRASH"
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        ContextEmptyTrashItem.IsEnabled = ViewModel.IsConnected && !ViewModel.IsBusy;
         ContextExpandBranchItem.IsEnabled = hasBranch;
         ContextCollapseBranchItem.IsEnabled = hasBranch;
     }
@@ -569,6 +573,56 @@ public sealed partial class MainPage : Page
         }
 
         await DeleteFolderWithConfirmationAsync(folder);
+    }
+
+    private async void EmptyTrash_Click(object sender, RoutedEventArgs e)
+    {
+        if (GetContextFolderItem()?.Folder is not { Id: "TRASH" })
+        {
+            return;
+        }
+
+        int messageCount;
+        try
+        {
+            messageCount = await ViewModel.GetTrashMessageCountAsync();
+        }
+        catch (Exception ex)
+        {
+            await ShowMessageAsync("Trash could not be checked", ex.GetBaseException().Message);
+            return;
+        }
+
+        if (messageCount == 0)
+        {
+            await ShowMessageAsync("Trash is empty", "Gmail reported no messages in Trash.");
+            return;
+        }
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "Permanently delete everything in Trash?",
+            Content = $"This permanently deletes {messageCount:N0} Gmail message{(messageCount == 1 ? string.Empty : "s")} and cannot be undone. Google will request an additional full-mailbox permission the first time because its API does not allow permanent deletion with GLook's normal Gmail permission.",
+            PrimaryButtonText = "Delete forever",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Close
+        };
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+        {
+            return;
+        }
+
+        try
+        {
+            await ViewModel.EmptyTrashAsync();
+            SyncFolderTree();
+            UpdateContentPanels();
+        }
+        catch (Exception ex)
+        {
+            await ShowMessageAsync("Trash was not fully emptied", ex.GetBaseException().Message);
+        }
     }
 
     private async Task DeleteFolderWithConfirmationAsync(MailFolder folder)

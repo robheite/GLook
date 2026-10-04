@@ -205,6 +205,12 @@ public static class AppSelfTestRunner
                 return $"Loaded {folders.Count} visible folders and labels, including Inbox. {categoryDetail}";
             });
 
+            await RunCheckAsync(checks, "Trash count loads read-only", async () =>
+            {
+                var messageCount = await gmail.GetFolderMessageCountAsync("TRASH", cancellationToken);
+                return $"Gmail reports {messageCount:N0} message{(messageCount == 1 ? string.Empty : "s")} currently in Trash; no messages were changed.";
+            });
+
             await RunCheckAsync(checks, "Inbox summaries load", async () =>
             {
                 threads = await gmail.GetThreadsAsync(
