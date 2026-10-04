@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "GLook (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "GLook (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

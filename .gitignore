@@ -1,0 +1,12 @@
+bin/
+obj/
+dist/
+artifacts/
+.vs/
+*.user
+*.suo
+*.pfx
+client_secret*.json
+credentials*.json
+LocalConfig/GoogleOAuthClient.json
+Screenshot*.png

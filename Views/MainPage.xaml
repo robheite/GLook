@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<Page x:Class="GLook.Views.MainPage"
+ xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+ xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+ xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+ xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+ xmlns:models="using:GLook.Models"
+ xmlns:primitives="using:Microsoft.UI.Xaml.Controls.Primitives"
+ mc:Ignorable="d" Background="Transparent" Loaded="Page_Loaded"
+ SizeChanged="Page_SizeChanged" Unloaded="Page_Unloaded">
+ <Page.Resources>
+  <Style x:Key="ComfortableThreadItemStyle" TargetType="ListViewItem" BasedOn="{StaticResource GLookListViewItemStyle}"><Setter Property="MinHeight" Value="92" /></Style>
+  <Style x:Key="CompactThreadItemStyle" TargetType="ListViewItem" BasedOn="{StaticResource GLookListViewItemStyle}"><Setter Property="MinHeight" Value="64" /></Style>
+  <MenuFlyout x:Key="FolderContextMenu" Closed="FolderContextMenu_Closed" Opening="FolderContextMenu_Opening">
+   <MenuFlyoutItem x:Name="ContextOpenFolderItem" Click="OpenFolder_Click" Text="Open"/>
+   <MenuFlyoutItem x:Name="ContextNewSubfolderItem" Click="NewSubfolder_Click" Text="New subfolder"/>
+   <MenuFlyoutItem x:Name="ContextRenameFolderItem" Click="RenameFolder_Click" Text="Rename label"/>
+   <MenuFlyoutItem x:Name="ContextDeleteFolderItem" Click="DeleteContextFolder_Click" Text="Delete label"/>
+   <MenuFlyoutSeparator/>
+   <MenuFlyoutItem x:Name="ContextExpandBranchItem" Click="ExpandFolderBranch_Click" Text="Expand branch"/>
+   <MenuFlyoutItem x:Name="ContextCollapseBranchItem" Click="CollapseFolderBranch_Click" Text="Collapse branch"/>
+   <MenuFlyoutItem Click="ExpandAllFolders_Click" Text="Expand all"/>
+   <MenuFlyoutItem Click="CollapseAllFolders_Click" Text="Collapse all"/>
+   <MenuFlyoutSeparator/>
+   <MenuFlyoutItem Click="SyncFolders_Click" Text="Sync selected folder"/>
+  </MenuFlyout>
+  <MenuFlyout x:Key="ThreadContextMenu" Closed="ThreadContextMenu_Closed" Opening="ThreadContextMenu_Opening">
+   <MenuFlyoutItem x:Name="ContextOpenThreadItem" Click="OpenConversation_Click" Text="Open conversation"/>
+   <MenuFlyoutSeparator/><MenuFlyoutItem x:Name="ContextReplyItem" Click="Reply_Click" Text="Reply"/><MenuFlyoutItem x:Name="ContextReplyAllItem" Click="ReplyAll_Click" Text="Reply all"/><MenuFlyoutItem x:Name="ContextForwardItem" Click="Forward_Click" Text="Forward"/>
+   <MenuFlyoutSeparator/><MenuFlyoutItem x:Name="ContextArchiveThreadItem" Click="ArchiveThread_Click" Text="Archive"/><MenuFlyoutItem x:Name="ContextTrashThreadItem" Click="DeleteThread_Click" Text="Move to Trash"/><MenuFlyoutItem x:Name="ContextRestoreThreadItem" Click="RestoreThread_Click" Text="Restore from Trash"/>
+   <MenuFlyoutItem x:Name="ContextReadThreadItem" Click="ToggleReadThread_Click" Text="Mark as read"/><MenuFlyoutItem x:Name="ContextStarThreadItem" Click="ToggleStarThread_Click" Text="Add star"/>
+   <MenuFlyoutSubItem x:Name="ContextMoveMenu" Text="Move to"/><MenuFlyoutSubItem x:Name="ContextLabelsMenu" Text="Labels"/>
+   <MenuFlyoutSeparator/><MenuFlyoutItem x:Name="ContextJunkThreadItem" Click="ToggleJunkThread_Click" Text="Mark as spam"/><MenuFlyoutItem x:Name="ContextOpenGmailItem" Click="OpenConversationInGmail_Click" Text="Open in Gmail"/>
+  </MenuFlyout>
+  <MenuFlyout x:Key="ThreadPaneContextMenu" Opening="ThreadPaneContextMenu_Opening">
+   <ToggleMenuFlyoutItem x:Name="ShowListToolbarContextItem" Click="ToggleMessageListToolbar_Click" Text="Show message-list toolbar"/>
+   <MenuFlyoutSeparator/>
+   <MenuFlyoutSubItem Text="Group by">
+    <ToggleMenuFlyoutItem x:Name="ContextGroupDateItem" Click="GroupDate_Click" Text="Date"/>
+    <ToggleMenuFlyoutItem x:Name="ContextGroupSenderItem" Click="GroupSender_Click" Text="Sender"/>
+    <ToggleMenuFlyoutItem x:Name="ContextGroupNoneItem" Click="GroupNone_Click" Text="None"/>
+   </MenuFlyoutSubItem>
+   <MenuFlyoutSubItem Text="Sort">
+    <ToggleMenuFlyoutItem x:Name="ContextSortNewestItem" Click="SortNewest_Click" Text="Newest first"/>
+    <ToggleMenuFlyoutItem x:Name="ContextSortOldestItem" Click="SortOldest_Click" Text="Oldest first"/>
+    <ToggleMenuFlyoutItem x:Name="ContextSortSenderAscItem" Click="SortSenderAsc_Click" Text="Sender A–Z"/>
+    <ToggleMenuFlyoutItem x:Name="ContextSortSenderDescItem" Click="SortSenderDesc_Click" Text="Sender Z–A"/>
+    <ToggleMenuFlyoutItem x:Name="ContextSortSubjectAscItem" Click="SortSubjectAsc_Click" Text="Subject A–Z"/>
+    <ToggleMenuFlyoutItem x:Name="ContextSortSubjectDescItem" Click="SortSubjectDesc_Click" Text="Subject Z–A"/>
+   </MenuFlyoutSubItem>
+   <MenuFlyoutSubItem Text="Display">
+    <ToggleMenuFlyoutItem x:Name="ContextShowPreviewItem" Click="TogglePreview_Click" Text="Show preview text"/>
+    <ToggleMenuFlyoutItem x:Name="ContextShowAvatarsItem" Click="ToggleAvatars_Click" Text="Show sender initials"/>
+   </MenuFlyoutSubItem>
+  </MenuFlyout>
+  <ContentDialog x:Name="ComposeDialog" MinWidth="680" AutomationProperties.Name="Compose email" CloseButtonClick="ComposeDialog_CloseButtonClick"
+   CloseButtonText="Close" DefaultButton="Primary" PrimaryButtonText="Send" SecondaryButtonText="Save draft"
+   PrimaryButtonClick="ComposeDialog_PrimaryButtonClick" SecondaryButtonClick="ComposeDialog_SecondaryButtonClick">
+   <Grid MinWidth="620" MaxWidth="760" RowSpacing="10">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <TextBox x:Name="ComposeToBox" AutomationProperties.Name="Recipients" Header="To" PlaceholderText="name@example.com" Text="{Binding ComposeTo,Mode=TwoWay,UpdateSourceTrigger=PropertyChanged}"/>
+    <Grid Grid.Row="1" ColumnSpacing="10"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+     <TextBox AutomationProperties.Name="Carbon copy recipients" Header="Cc" PlaceholderText="Optional" Text="{Binding ComposeCc,Mode=TwoWay,UpdateSourceTrigger=PropertyChanged}"/>
+     <TextBox Grid.Column="1" AutomationProperties.Name="Blind carbon copy recipients" Header="Bcc" PlaceholderText="Optional" Text="{Binding ComposeBcc,Mode=TwoWay,UpdateSourceTrigger=PropertyChanged}"/>
+    </Grid>
+    <TextBox Grid.Row="2" AutomationProperties.Name="Subject" Header="Subject" Text="{Binding ComposeSubject,Mode=TwoWay,UpdateSourceTrigger=PropertyChanged}"/>
+    <CommandBar Grid.Row="3" DefaultLabelPosition="Right"><AppBarButton AutomationProperties.Name="Attach files" Click="AttachFiles_Click" Icon="Attach" Label="Attach"/><CommandBar.SecondaryCommands><AppBarButton Click="DiscardCompose_Click" Icon="Delete" Label="Discard draft"/></CommandBar.SecondaryCommands></CommandBar>
+    <TextBox Grid.Row="4" MinHeight="240" AcceptsReturn="True" AutomationProperties.Name="Message body" Header="Message" IsSpellCheckEnabled="True" Text="{Binding ComposeBody,Mode=TwoWay,UpdateSourceTrigger=PropertyChanged}" TextWrapping="Wrap"/>
+    <StackPanel Grid.Row="5" Spacing="4"><ItemsControl ItemsSource="{Binding ComposeRetainedAttachments}"><ItemsControl.ItemsPanel><ItemsPanelTemplate><ItemsWrapGrid Orientation="Horizontal"/></ItemsPanelTemplate></ItemsControl.ItemsPanel><ItemsControl.ItemTemplate><DataTemplate x:DataType="models:MailAttachmentInput"><Button Margin="0,0,8,6" AutomationProperties.Name="Remove retained attachment" Click="RemoveAttachment_Click" CommandParameter="{x:Bind}"><StackPanel Orientation="Horizontal" Spacing="7"><FontIcon FontSize="13" Glyph="&#xE723;"/><TextBlock MaxWidth="220" Text="{x:Bind FileName}" TextTrimming="CharacterEllipsis"/><TextBlock Style="{StaticResource GLookMetadataStyle}" Text="(from message)"/><FontIcon FontSize="11" Glyph="&#xE711;"/></StackPanel></Button></DataTemplate></ItemsControl.ItemTemplate></ItemsControl><ItemsControl ItemsSource="{Binding ComposeAttachmentPaths}"><ItemsControl.ItemsPanel><ItemsPanelTemplate><ItemsWrapGrid Orientation="Horizontal"/></ItemsPanelTemplate></ItemsControl.ItemsPanel><ItemsControl.ItemTemplate><DataTemplate><Button Margin="0,0,8,6" AutomationProperties.Name="Remove attachment" Click="RemoveAttachment_Click" CommandParameter="{Binding}"><StackPanel Orientation="Horizontal" Spacing="7"><FontIcon FontSize="13" Glyph="&#xE723;"/><TextBlock MaxWidth="220" Text="{Binding}" TextTrimming="CharacterEllipsis"/><FontIcon FontSize="11" Glyph="&#xE711;"/></StackPanel></Button></DataTemplate></ItemsControl.ItemTemplate></ItemsControl></StackPanel>
+    <TextBlock Grid.Row="6" Foreground="{ThemeResource SystemFillColorCriticalBrush}" Text="{Binding ComposeErrorText}" TextWrapping="Wrap"/>
+   </Grid>
+  </ContentDialog>
+ </Page.Resources>
+ <Page.KeyboardAccelerators>
+  <KeyboardAccelerator Key="N" Modifiers="Control" Invoked="NewEmail_AcceleratorInvoked"/><KeyboardAccelerator Key="R" Modifiers="Control" Invoked="Reply_AcceleratorInvoked"/>
+  <KeyboardAccelerator Key="R" Modifiers="Control,Shift" Invoked="ReplyAll_AcceleratorInvoked"/><KeyboardAccelerator Key="F" Modifiers="Control" Invoked="Forward_AcceleratorInvoked"/>
+  <KeyboardAccelerator Key="E" Modifiers="Control" Invoked="Search_AcceleratorInvoked"/><KeyboardAccelerator Key="F9" Invoked="Sync_AcceleratorInvoked"/><KeyboardAccelerator Key="F9" Modifiers="Shift" Invoked="SyncAll_AcceleratorInvoked"/><KeyboardAccelerator Key="Delete" Invoked="Delete_AcceleratorInvoked"/>
+ </Page.KeyboardAccelerators>
+ <Grid Background="{ThemeResource GLookCanvasBrush}" KeyboardAcceleratorPlacementMode="Hidden">
+  <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+  <CommandBar Grid.Row="0" Background="{ThemeResource GLookReadingBrush}" BorderBrush="{ThemeResource GLookSeparatorBrush}" BorderThickness="0,0,0,1" DefaultLabelPosition="Right" IsDynamicOverflowEnabled="True">
+   <AppBarButton AutomationProperties.Name="New email" Click="NewEmail_Click" Icon="Mail" IsEnabled="{Binding IsConnected}" Label="New email"/><AppBarSeparator/>
+   <AppBarButton AutomationProperties.Name="Toggle folders" Click="ToggleFolders_Click" Icon="GlobalNavigationButton" Label="Folders"/>
+   <AppBarButton AutomationProperties.HelpText="Sync the selected Gmail folder" Click="Refresh_Click" Icon="Refresh" IsEnabled="{Binding CanSync}" Label="Sync folder"/>
+   <AppBarButton AutomationProperties.HelpText="Sync the ten newest conversations in every displayed Gmail folder and label" Click="SyncAll_Click" IsEnabled="{Binding CanSync}" Label="Sync all"><AppBarButton.Icon><FontIcon Glyph="&#xE895;"/></AppBarButton.Icon></AppBarButton>
+   <AppBarButton Click="NewFolder_Click" Icon="NewFolder" IsEnabled="{Binding IsConnected}" Label="New folder"/>
+    <AppBarButton Click="ArchiveThread_Click" IsEnabled="{Binding HasActionSelection}" Label="Archive"><AppBarButton.Icon><FontIcon Glyph="&#xE7B8;"/></AppBarButton.Icon></AppBarButton>
+    <AppBarButton AutomationProperties.Name="Move conversation to Trash" Click="DeleteThread_Click" Icon="Delete" IsEnabled="{Binding HasActionSelection}" Label="Delete"/>
+    <AppBarButton Click="ToggleReadThread_Click" IsEnabled="{Binding HasActionSelection}" Label="Read / unread"><AppBarButton.Icon><FontIcon Glyph="&#xE715;"/></AppBarButton.Icon></AppBarButton>
+    <AppBarButton Click="ToggleStarThread_Click" IsEnabled="{Binding HasActionSelection}" Label="Star"><AppBarButton.Icon><FontIcon Glyph="&#xE734;"/></AppBarButton.Icon></AppBarButton>
+    <AppBarButton IsEnabled="{Binding HasActionSelection}" Label="Move"><AppBarButton.Icon><FontIcon Glyph="&#xE8DE;"/></AppBarButton.Icon><AppBarButton.Flyout><MenuFlyout x:Name="MoveMenu" Opening="MoveMenu_Opening"/></AppBarButton.Flyout></AppBarButton>
+    <AppBarButton IsEnabled="{Binding HasActionSelection}" Label="Labels"><AppBarButton.Icon><FontIcon Glyph="&#xE8EC;"/></AppBarButton.Icon><AppBarButton.Flyout><MenuFlyout x:Name="LabelsMenu" Opening="LabelsMenu_Opening"/></AppBarButton.Flyout></AppBarButton>
+   <CommandBar.Content><Grid MinWidth="240" Width="380"><AutoSuggestBox x:Name="SearchBox" AutomationProperties.Name="Search mail" PlaceholderText="Search Gmail" QueryIcon="Find" QuerySubmitted="SearchBox_QuerySubmitted" Text="{Binding SearchQuery,Mode=TwoWay,UpdateSourceTrigger=PropertyChanged}"/></Grid></CommandBar.Content>
+   <CommandBar.SecondaryCommands>
+     <AppBarButton Click="DeleteFolder_Click" Label="Delete selected folder"/><AppBarButton Click="JunkThread_Click" IsEnabled="{Binding HasActionSelection}" Label="Mark as spam"/>
+    <AppBarButton Label="View options"><AppBarButton.Icon><FontIcon Glyph="&#xE890;"/></AppBarButton.Icon><AppBarButton.Flyout><MenuFlyout>
+     <MenuFlyoutSubItem Text="Reading pane"><ToggleMenuFlyoutItem x:Name="ReadingPaneRightItem" Click="ReadingPaneRight_Click" Text="Right"/><ToggleMenuFlyoutItem x:Name="ReadingPaneBottomItem" Click="ReadingPaneBottom_Click" Text="Bottom"/><ToggleMenuFlyoutItem x:Name="ReadingPaneOffItem" Click="ReadingPaneOff_Click" Text="Off"/></MenuFlyoutSubItem>
+     <MenuFlyoutSubItem Text="Message density"><ToggleMenuFlyoutItem x:Name="ComfortableDensityItem" Click="ComfortableDensity_Click" Text="Comfortable"/><ToggleMenuFlyoutItem x:Name="CompactDensityItem" Click="CompactDensity_Click" Text="Compact"/></MenuFlyoutSubItem>
+     </MenuFlyout></AppBarButton.Flyout></AppBarButton><AppBarButton AutomationProperties.Name="GLook settings" Click="Settings_Click" Icon="Setting" Label="Settings"/><AppBarButton Click="Signatures_Click" Icon="Edit" IsEnabled="{Binding IsConnected}" Label="Signatures"/><AppBarButton Click="Account_Click" Icon="Contact" Label="Account"/>
+   </CommandBar.SecondaryCommands>
+  </CommandBar>
+  <SplitView x:Name="FolderSplitView" Grid.Row="1" CompactPaneLength="0" DisplayMode="Inline" IsPaneOpen="True" OpenPaneLength="252" PaneBackground="{ThemeResource GLookPaneBrush}">
+   <SplitView.Pane><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="6"/></Grid.ColumnDefinitions>
+    <Grid BorderBrush="{ThemeResource GLookSeparatorBrush}" BorderThickness="0,0,1,0"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+     <Grid Margin="14,16,14,12" ColumnSpacing="10"><Grid.ColumnDefinitions><ColumnDefinition Width="42"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions><Image Width="42" Height="42" AutomationProperties.Name="GLook logo" Source="ms-appx:///Assets/Square150x150Logo.scale-200.png"/><StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="1"><TextBlock Foreground="{ThemeResource GLookBrandStrongBrush}" FontFamily="Segoe UI Variable Display" FontSize="23" FontWeight="Bold" Text="GLook"/><TextBlock MaxLines="2" Style="{StaticResource GLookMetadataStyle}" Text="Gmail, without the&#xA;double-work" TextWrapping="Wrap"/></StackPanel></Grid>
+     <Button Grid.Row="1" Margin="12,4,12,12" AutomationProperties.Name="{Binding ConnectionButtonAccessibleName}" Click="Connect_Click" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" Style="{StaticResource AccentButtonStyle}"><StackPanel Orientation="Horizontal" Spacing="10"><FontIcon FontSize="15" Glyph="&#xE77B;"/><TextBlock Text="{Binding ConnectionButtonText}" TextTrimming="CharacterEllipsis"/></StackPanel></Button>
+     <TreeView x:Name="FolderTree" Grid.Row="2" AutomationProperties.Name="Gmail folders and labels" ContextFlyout="{StaticResource FolderContextMenu}" ItemInvoked="FolderTree_ItemInvoked" RightTapped="FolderTree_RightTapped" SelectionMode="Single"><TreeView.ItemTemplate><DataTemplate><Grid Padding="10,7"><Grid.ColumnDefinitions><ColumnDefinition Width="24"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><FontIcon FontSize="14" Glyph="{Binding Content.Glyph}"/><TextBlock Grid.Column="1" Text="{Binding Content.Name}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/><TextBlock Grid.Column="2" Style="{StaticResource GLookMetadataStyle}" Text="{Binding Content.CountText}" VerticalAlignment="Center"/></Grid></DataTemplate></TreeView.ItemTemplate></TreeView>
+     <StackPanel Grid.Row="3" Margin="16" Spacing="2"><TextBlock Style="{StaticResource GLookSectionLabelStyle}" Text="ACCOUNT"/><TextBlock Text="{Binding AccountEmail}" TextTrimming="CharacterEllipsis"/></StackPanel>
+    </Grid>
+    <primitives:Thumb Grid.Column="1" AutomationProperties.HelpText="Drag left or right to resize the folder pane" AutomationProperties.Name="Resize folder pane" Background="Transparent" DragCompleted="FolderResizeThumb_DragCompleted" DragDelta="FolderResizeThumb_DragDelta" PointerEntered="ResizeThumb_PointerEntered" PointerExited="ResizeThumb_PointerExited" PointerMoved="ResizeThumb_PointerMoved"><primitives:Thumb.Template><ControlTemplate TargetType="primitives:Thumb"><Grid Background="Transparent"><Rectangle Width="1" HorizontalAlignment="Center" Fill="{ThemeResource GLookSeparatorBrush}"/></Grid></ControlTemplate></primitives:Thumb.Template></primitives:Thumb>
+   </Grid></SplitView.Pane>
+   <Grid x:Name="MailWorkspace"><Grid.ColumnDefinitions><ColumnDefinition x:Name="ThreadColumn" Width="390"/><ColumnDefinition x:Name="DividerColumn" Width="6"/><ColumnDefinition x:Name="ReadingColumn" Width="*"/></Grid.ColumnDefinitions><Grid.RowDefinitions><RowDefinition x:Name="ThreadRow" Height="*"/><RowDefinition x:Name="DividerRow" Height="0"/><RowDefinition x:Name="ReadingRow" Height="0"/></Grid.RowDefinitions>
+    <Grid x:Name="ThreadListPane" Background="{ThemeResource GLookThreadBrush}"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+     <StackPanel Grid.Row="0" Margin="20,18,16,12" ContextFlyout="{StaticResource ThreadPaneContextMenu}" Spacing="3"><TextBlock FontFamily="Segoe UI Variable Display" FontSize="22" FontWeight="SemiBold" Text="{Binding SelectedFolder.Name,FallbackValue=Inbox}"/><TextBlock Style="{StaticResource GLookMetadataStyle}" Text="Recent Gmail conversations"/></StackPanel>
+     <CommandBar x:Name="MessageListCommandBar" Grid.Row="1" AutomationProperties.Name="Conversation list view controls" ContextFlyout="{StaticResource ThreadPaneContextMenu}" DefaultLabelPosition="Right" IsDynamicOverflowEnabled="True">
+      <AppBarButton x:Name="SortThreadsButton" Label="Sort"><AppBarButton.Icon><FontIcon Glyph="&#xE8CB;"/></AppBarButton.Icon><AppBarButton.Flyout><MenuFlyout>
+       <ToggleMenuFlyoutItem x:Name="ToolbarSortNewestItem" Click="SortNewest_Click" Text="Newest first"/><ToggleMenuFlyoutItem x:Name="ToolbarSortOldestItem" Click="SortOldest_Click" Text="Oldest first"/>
+       <MenuFlyoutSeparator/><ToggleMenuFlyoutItem x:Name="ToolbarSortSenderAscItem" Click="SortSenderAsc_Click" Text="Sender A–Z"/><ToggleMenuFlyoutItem x:Name="ToolbarSortSenderDescItem" Click="SortSenderDesc_Click" Text="Sender Z–A"/>
+       <ToggleMenuFlyoutItem x:Name="ToolbarSortSubjectAscItem" Click="SortSubjectAsc_Click" Text="Subject A–Z"/><ToggleMenuFlyoutItem x:Name="ToolbarSortSubjectDescItem" Click="SortSubjectDesc_Click" Text="Subject Z–A"/>
+      </MenuFlyout></AppBarButton.Flyout></AppBarButton>
+      <AppBarButton x:Name="GroupThreadsButton" Label="Group"><AppBarButton.Icon><FontIcon Glyph="&#xE8FD;"/></AppBarButton.Icon><AppBarButton.Flyout><MenuFlyout>
+       <ToggleMenuFlyoutItem x:Name="ToolbarGroupDateItem" Click="GroupDate_Click" Text="Date"/><ToggleMenuFlyoutItem x:Name="ToolbarGroupSenderItem" Click="GroupSender_Click" Text="Sender"/><ToggleMenuFlyoutItem x:Name="ToolbarGroupNoneItem" Click="GroupNone_Click" Text="None"/>
+      </MenuFlyout></AppBarButton.Flyout></AppBarButton>
+      <AppBarButton Label="Display"><AppBarButton.Icon><FontIcon Glyph="&#xE890;"/></AppBarButton.Icon><AppBarButton.Flyout><MenuFlyout>
+       <ToggleMenuFlyoutItem x:Name="ToolbarShowPreviewItem" Click="TogglePreview_Click" Text="Show preview text"/><ToggleMenuFlyoutItem x:Name="ToolbarShowAvatarsItem" Click="ToggleAvatars_Click" Text="Show sender initials"/>
+       <MenuFlyoutSeparator/><MenuFlyoutItem Click="ToggleMessageListToolbar_Click" Text="Hide this toolbar"/>
+      </MenuFlyout></AppBarButton.Flyout></AppBarButton>
+      <CommandBar.Content><TextBlock x:Name="ThreadSelectionStatus" Margin="8,0" Style="{StaticResource GLookMetadataStyle}" Text="" VerticalAlignment="Center" Visibility="Collapsed"/></CommandBar.Content>
+      <CommandBar.SecondaryCommands><AppBarButton Click="SelectAllThreads_Click" Icon="SelectAll" Label="Select all conversations"/><AppBarButton Click="ClearThreadSelection_Click" Icon="ClearSelection" Label="Clear selection"/></CommandBar.SecondaryCommands>
+     </CommandBar>
+      <ListView x:Name="ThreadList" Grid.Row="2" AutomationProperties.Name="Conversations" ContainerContentChanging="ThreadList_ContainerContentChanging" ContextFlyout="{StaticResource ThreadContextMenu}" IsItemClickEnabled="True" IsMultiSelectCheckBoxEnabled="False" ItemClick="ThreadList_ItemClick" RightTapped="ThreadList_RightTapped" SelectionChanged="ThreadList_SelectionChanged" ItemContainerStyle="{StaticResource ComfortableThreadItemStyle}" SelectionMode="Multiple">
+      <ListView.GroupStyle><GroupStyle HidesIfEmpty="False"><GroupStyle.HeaderTemplate><DataTemplate x:DataType="models:MailThreadGroup"><Button MinHeight="40" Padding="12,7,10,5" AutomationProperties.HelpText="{x:Bind ToggleHelpText}" AutomationProperties.Name="{x:Bind AutomationName}" Background="Transparent" BorderThickness="0" Click="ThreadGroupHeader_Click" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch"><StackPanel Orientation="Horizontal" Spacing="8"><FontIcon FontSize="10" Foreground="{ThemeResource GLookMutedBrush}" Glyph="{x:Bind ChevronGlyph}"/><TextBlock Foreground="{ThemeResource GLookBrandStrongBrush}" FontSize="12" FontWeight="SemiBold" Text="{x:Bind Title}"/></StackPanel></Button></DataTemplate></GroupStyle.HeaderTemplate></GroupStyle></ListView.GroupStyle>
+       <ListView.ItemTemplate>
+        <DataTemplate x:DataType="models:MailThreadSummary">
+         <Grid Tag="ThreadLayout" Padding="8,7">
+          <Grid.ColumnDefinitions><ColumnDefinition Width="34"/><ColumnDefinition Width="38"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="36"/></Grid.ColumnDefinitions>
+          <CheckBox x:Name="ThreadSelectionCheckBox" Grid.Column="0" MinWidth="32" MinHeight="32" HorizontalAlignment="Center" VerticalAlignment="Top" AutomationProperties.Name="Select conversation" Checked="ThreadSelectionCheckBox_Checked" CommandParameter="{x:Bind}" Tapped="ThreadSelectionCheckBox_Tapped" Unchecked="ThreadSelectionCheckBox_Unchecked"/>
+          <Grid Grid.Column="1" Tag="ThreadAvatar" Width="30" Height="30" VerticalAlignment="Top"><Ellipse Fill="{ThemeResource AccentFillColorSecondaryBrush}"/><TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="11" FontWeight="SemiBold" Text="{x:Bind Initials}"/></Grid>
+          <StackPanel Grid.Column="2" Margin="3,0,10,0" Spacing="2"><StackPanel Orientation="Horizontal" Spacing="5"><TextBlock Foreground="{ThemeResource GLookCoralBrush}" FontSize="9" Text="{x:Bind UnreadMarker}"/><TextBlock FontWeight="SemiBold" MaxLines="1" Text="{x:Bind Sender}" TextTrimming="CharacterEllipsis"/></StackPanel><TextBlock FontSize="13" MaxLines="1" Text="{x:Bind Subject}" TextTrimming="CharacterEllipsis"/><TextBlock Tag="ThreadPreview" MaxLines="2" Style="{StaticResource GLookMetadataStyle}" Text="{x:Bind Snippet}" TextTrimming="CharacterEllipsis" TextWrapping="Wrap"/></StackPanel>
+          <StackPanel Grid.Column="3" HorizontalAlignment="Right" Spacing="6"><TextBlock Style="{StaticResource GLookMetadataStyle}" Text="{x:Bind ReceivedText}"/><TextBlock HorizontalAlignment="Right" Foreground="{ThemeResource GLookCoralBrush}" Text="{x:Bind StarMarker}"/></StackPanel>
+          <Button Grid.Column="4" Width="32" Height="32" Padding="0" HorizontalAlignment="Right" VerticalAlignment="Top" AutomationProperties.Name="Move conversation to Trash" Click="DeleteThreadCard_Click" CommandParameter="{x:Bind}" Style="{StaticResource SubtleButtonStyle}" ToolTipService.ToolTip="Move to Trash"><FontIcon FontSize="14" Glyph="&#xE74D;"/></Button>
+         </Grid>
+        </DataTemplate>
+       </ListView.ItemTemplate>
+     </ListView>
+    </Grid>
+    <primitives:Thumb x:Name="MessageResizeThumb" Grid.Column="1" AutomationProperties.HelpText="Drag to resize the conversation list and reading pane" AutomationProperties.Name="Resize message list and reading pane" Background="Transparent" DragCompleted="MessageResizeThumb_DragCompleted" DragDelta="MessageResizeThumb_DragDelta" PointerEntered="ResizeThumb_PointerEntered" PointerExited="ResizeThumb_PointerExited" PointerMoved="ResizeThumb_PointerMoved"><primitives:Thumb.Template><ControlTemplate TargetType="primitives:Thumb"><Grid Background="Transparent"><Rectangle HorizontalAlignment="Stretch" VerticalAlignment="Stretch" Fill="{ThemeResource GLookSeparatorBrush}"/></Grid></ControlTemplate></primitives:Thumb.Template></primitives:Thumb>
+    <Grid x:Name="ReadingPane" Grid.Column="2" Background="{ThemeResource GLookReadingBrush}"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+     <Grid Padding="20,14" BorderBrush="{ThemeResource GLookSeparatorBrush}" BorderThickness="0,0,0,1"><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions><Button x:Name="CompactBackButton" Margin="0,0,12,0" AutomationProperties.Name="Back to conversations" Click="CompactBack_Click" Style="{StaticResource SubtleButtonStyle}" Visibility="Collapsed"><FontIcon Glyph="&#xE72B;"/></Button><StackPanel Grid.Column="1" Spacing="3"><TextBlock x:Name="ReadingTitle" FontFamily="Segoe UI Variable Display" FontSize="24" FontWeight="SemiBold" MaxLines="2" Text="Connect your Gmail account" TextTrimming="CharacterEllipsis" TextWrapping="Wrap"/><TextBlock x:Name="ReadingSubtitle" Style="{StaticResource GLookMetadataStyle}" Text="Sign in securely with your Google account."/></StackPanel></Grid>
+     <CommandBar x:Name="ReadingCommandBar" Grid.Row="1" DefaultLabelPosition="Right" IsDynamicOverflowEnabled="True" Visibility="Collapsed"><AppBarButton Click="Reply_Click" Label="Reply"><AppBarButton.Icon><FontIcon Glyph="&#xE97A;"/></AppBarButton.Icon></AppBarButton><AppBarButton Click="ReplyAll_Click" Label="Reply all"><AppBarButton.Icon><FontIcon Glyph="&#xE97B;"/></AppBarButton.Icon></AppBarButton><AppBarButton Click="Forward_Click" Label="Forward"><AppBarButton.Icon><FontIcon Glyph="&#xE97C;"/></AppBarButton.Icon></AppBarButton><AppBarButton Click="ArchiveThread_Click" Label="Archive"><AppBarButton.Icon><FontIcon Glyph="&#xE7B8;"/></AppBarButton.Icon></AppBarButton><AppBarButton Click="DeleteThread_Click" Icon="Delete" Label="Delete"/></CommandBar>
+     <Grid Grid.Row="2"><StackPanel x:Name="OnboardingPanel" MaxWidth="520" Padding="32" HorizontalAlignment="Center" Spacing="14" VerticalAlignment="Center"><Image Width="88" Height="88" HorizontalAlignment="Left" AutomationProperties.Name="GLook logo" Source="ms-appx:///Assets/Square150x150Logo.scale-200.png"/><TextBlock FontFamily="Segoe UI Variable Display" FontSize="28" FontWeight="SemiBold" Text="Bring Gmail into one dependable workspace" TextWrapping="Wrap"/><TextBlock Foreground="{ThemeResource GLookMutedBrush}" FontSize="15" LineHeight="23" Text="GLook mirrors Gmail labels as folders. Compose, reply, move, label, archive, and delete all sync directly with Gmail." TextWrapping="Wrap"/><Button AutomationProperties.Name="Connect Gmail" Click="Connect_Click" HorizontalAlignment="Left" Style="{StaticResource AccentButtonStyle}" Content="Connect Gmail"/><TextBlock Style="{StaticResource GLookMetadataStyle}" Text="Your OAuth token is encrypted for your Windows account. GLook never stores your Google password." TextWrapping="Wrap"/></StackPanel>
+      <StackPanel x:Name="EmptySelectionPanel" MaxWidth="420" HorizontalAlignment="Center" Spacing="10" VerticalAlignment="Center" Visibility="Collapsed"><FontIcon FontSize="34" Foreground="{ThemeResource GLookMutedBrush}" Glyph="&#xE8C3;"/><TextBlock HorizontalAlignment="Center" FontSize="20" FontWeight="SemiBold" Text="Choose a conversation"/><TextBlock HorizontalAlignment="Center" Style="{StaticResource GLookMetadataStyle}" Text="Your message will open here."/></StackPanel>
+      <Grid x:Name="MessageContentHost" Visibility="Collapsed"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions><Border x:Name="RemoteContentBanner" Padding="16,8" Background="{ThemeResource GLookPaneBrush}" BorderBrush="{ThemeResource GLookSeparatorBrush}" BorderThickness="0,0,0,1" Visibility="Collapsed"><Grid ColumnSpacing="12"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><TextBlock VerticalAlignment="Center" Style="{StaticResource GLookMetadataStyle}" Text="Remote images are blocked to prevent direct tracking requests." TextWrapping="Wrap"/><Button Grid.Column="1" Click="ShowRemoteContent_Click" Content="Show images" Style="{StaticResource SubtleButtonStyle}"/></Grid></Border><WebView2 x:Name="MessageWebView" Grid.Row="1" AutomationProperties.Name="Conversation message content"/><ScrollViewer x:Name="MessageTextFallback" Grid.Row="1" Padding="28,20" Visibility="Collapsed"><TextBlock x:Name="MessageTextFallbackContent" IsTextSelectionEnabled="True" TextWrapping="Wrap"/></ScrollViewer></Grid>
+     </Grid>
+    </Grid>
+   </Grid>
+  </SplitView>
+  <Grid Grid.Row="2" Padding="12,8" Background="{ThemeResource GLookPaneBrush}" BorderBrush="{ThemeResource GLookSeparatorBrush}" BorderThickness="0,1,0,0">
+   <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+   <FontIcon Foreground="{ThemeResource GLookSyncBrush}" FontSize="13" Glyph="{Binding SyncGlyph}"/>
+   <TextBlock Grid.Column="1" Margin="9,0,0,0" AutomationProperties.LiveSetting="Polite" AutomationProperties.Name="{Binding SyncStatusAnnouncement}" FontSize="12" TextTrimming="CharacterEllipsis"><Run FontWeight="SemiBold" Text="{Binding SyncStatusText}"/><Run Text="  "/><Run Foreground="{ThemeResource GLookMutedBrush}" Text="{Binding SyncStatusDetail}"/></TextBlock>
+   <ProgressBar x:Name="SyncAllProgressBar" Grid.Column="2" Width="150" Margin="12,0" AutomationProperties.Name="Sync all folders progress" Maximum="100" Value="{Binding SyncProgressValue}" VerticalAlignment="Center" Visibility="Collapsed"/>
+   <Button x:Name="CancelSyncAllButton" Grid.Column="3" Margin="0,0,12,0" AutomationProperties.HelpText="Stop after the current Gmail request" Click="CancelSyncAll_Click" Content="Cancel" Style="{StaticResource SubtleButtonStyle}" Visibility="Collapsed"/>
+   <ProgressRing Grid.Column="4" Width="16" Height="16" IsActive="{Binding IsBusy}"/>
+  </Grid>
+ </Grid>
+</Page>
