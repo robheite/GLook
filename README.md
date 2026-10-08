@@ -30,6 +30,9 @@ The first working slice includes:
 - right-clicking Gmail Trash exposes **Empty Trash…**, which shows the live message count and requires explicit confirmation before permanent deletion;
 - DPAPI-encrypted SQLite cache for recent conversation summaries and offline fallback;
 - true nested label navigation with preserved expansion and scroll position;
+- quota-governed Gmail history synchronization with a DPAPI-protected per-account cursor and a bounded recovery path when Gmail expires old history;
+- multiple Gmail mailboxes with isolated OAuth credentials, cache partitions, signatures, sync/notification preferences, ordering, reauthorization, and safe per-account removal;
+- an optional Board view with a mailbox selector, user-editable workflow headings, explicit per-mailbox Gmail-label mappings, and separate **Move** versus **Add label** actions;
 - Windows new-mail notifications while GLook is running, with a test control and configurable automatic sync (five minutes by default);
 - light, dark, and high-contrast-aware resources.
 
@@ -90,9 +93,9 @@ Run the built executable with `--self-test` to validate the stored Gmail session
 .\bin\x64\Debug\net10.0-windows10.0.19041.0\win-x64\GLook.exe --self-test
 ```
 
-The self-test verifies the local SQLite cache, Windows notification registration and enabled state, local signature identity, HTML formatting and active-content safeguards, encrypted-session reconnect, Gmail profile, labels, a five-conversation Inbox sample, one conversation-body fetch, and a cache round-trip. It never calls Gmail label creation/deletion, read-state, or Trash endpoints. The JSON result is written to `%LOCALAPPDATA%\GLook\self-test-report.json`.
+The self-test verifies the local SQLite cache, atomic encrypted history/cursor transactions, Gmail quota weights, Windows notification registration and enabled state, local signature identity, HTML formatting and active-content safeguards, encrypted-session reconnect, Gmail profile, labels, a five-conversation Inbox sample, one conversation-body fetch, and a cache round-trip. It never calls Gmail label creation/deletion, read-state, or Trash endpoints. The JSON result is written to `%LOCALAPPDATA%\GLook\self-test-report.json`.
 
-Use `--self-test-sync-all` for the longer read-only integration check that downloads and caches the ten newest conversations for every Gmail folder and label currently displayed by GLook. A selected-folder sync still loads its normal forty-conversation view. The check writes `%LOCALAPPDATA%\GLook\sync-all-test-report.json` and may take several minutes for accounts with many labels.
+Use `--self-test-sync-all` for the read-only integration check that runs the same history-based mailbox synchronization as **Sync All**, verifies completion/progress, and keeps the selected folder available. The check writes `%LOCALAPPDATA%\GLook\sync-all-test-report.json`.
 
 To send a real Windows test notification and confirm that Windows retained it in Notification Center, use **Settings > Send test notification** or run:
 
@@ -114,7 +117,7 @@ Right-click a conversation for state-aware mail actions: open, reply, reply all,
 
 ## Notifications
 
-GLook registers with the Windows app notification system and automatically refreshes the selected folder and checks unread Inbox mail every five minutes by default while the process is running, including while the window is minimized. Change or disable this interval in **Settings**; supported intervals are 1–60 minutes. The first poll establishes a baseline so existing unread mail does not create a burst of old notifications. Closing GLook stops polling; closed-app delivery will require a future background helper or a server-backed Gmail push channel.
+GLook registers with the Windows app notification system and automatically checks Gmail history for every sync-enabled mailbox every five minutes by default while the process is running, including while the window is minimized. Only new history entries that remain in Inbox and unread become notification candidates; there is no second unread-Inbox API poll. Notifications identify the originating Gmail address and respect each mailbox's notification toggle. Change or disable the interval in **Settings**; supported intervals are 1–60 minutes. Closing GLook stops polling; closed-app delivery will require a future background helper or a server-backed Gmail push channel.
 
 ## Gmail behavior contract
 

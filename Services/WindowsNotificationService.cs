@@ -46,7 +46,7 @@ public sealed class WindowsNotificationService : IDisposable
         }
     }
 
-    public void ShowNewMail(MailThreadSummary thread)
+    public void ShowNewMail(MailThreadSummary thread, string? accountEmail = null)
     {
         if (!isRegistered || Setting != AppNotificationSetting.Enabled)
         {
@@ -56,7 +56,10 @@ public sealed class WindowsNotificationService : IDisposable
         var notification = new AppNotificationBuilder()
             .AddArgument("action", "viewConversation")
             .AddArgument("threadId", thread.Id)
-            .AddText("New mail in GLook")
+            .AddArgument("account", accountEmail ?? string.Empty)
+            .AddText(string.IsNullOrWhiteSpace(accountEmail)
+                ? "New mail in GLook"
+                : $"New mail in {accountEmail}")
             .AddText(thread.Sender)
             .AddText(thread.Subject)
             .BuildNotification();

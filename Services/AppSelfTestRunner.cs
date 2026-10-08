@@ -54,14 +54,171 @@ public static class AppSelfTestRunner
         var startedAt = DateTimeOffset.Now;
         var checks = new List<AppSelfTestCheck>();
         var appDataPath = Path.GetDirectoryName(ReportPath)!;
-        var secureStore = new EncryptedDataStore(Path.Combine(appDataPath, "secure"));
-        var localStore = new LocalMailStore(Path.Combine(appDataPath, "mail.db"));
-        var gmail = new GmailClientService(secureStore);
+        var context = await CreateSelfTestContextAsync(appDataPath, cancellationToken);
+        var localStore = context.LocalStore;
+        var gmail = context.Gmail;
 
         await RunCheckAsync(checks, "Local cache opens", async () =>
         {
             await localStore.InitializeAsync();
             return "SQLite cache schema is available.";
+        });
+
+        await RunCheckAsync(checks, "Startup reconnect stays non-interactive", async () =>
+        {
+            var testDirectory = Path.Combine(
+                Path.GetTempPath(),
+                $"GLook-silent-reconnect-self-test-{Guid.NewGuid():N}");
+            try
+            {
+                var disconnectedClient = new GmailClientService(new EncryptedDataStore(testDirectory));
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timeout.CancelAfter(TimeSpan.FromSeconds(2));
+                var profile = await disconnectedClient.TryReconnectAsync(timeout.Token);
+                if (profile is not null)
+                {
+                    throw new InvalidOperationException("An empty credential store unexpectedly restored a Gmail account.");
+                }
+            }
+            finally
+            {
+                if (Directory.Exists(testDirectory))
+                {
+                    Directory.Delete(testDirectory, recursive: true);
+                }
+            }
+
+            return "Startup checks only encrypted saved credentials; browser OAuth requires an explicit Connect or Reauthorize action.";
+        });
+
+        await RunCheckAsync(checks, "History cursor and quota safeguards", async () =>
+        {
+            if (GmailQuotaGovernor.UnitsFor(GmailApiMethod.HistoryList) != 2
+                || GmailQuotaGovernor.UnitsFor(GmailApiMethod.ThreadsGet) != 40
+                || GmailQuotaGovernor.BackgroundUnitsPerMinute != 4_500)
+            {
+                throw new InvalidOperationException("Gmail quota weights or the background reserve changed unexpectedly.");
+            }
+
+            var testDirectory = Path.Combine(
+                Path.GetTempPath(),
+                $"GLook-history-self-test-{Guid.NewGuid():N}");
+            try
+            {
+                var testStore = new LocalMailStore(Path.Combine(testDirectory, "history.db"));
+                await testStore.InitializeAsync();
+                testStore.SetAccountScope("history-self-test@example.invalid");
+                var thread = new MailThreadSummary(
+                    "history-thread",
+                    "GLook",
+                    "History transaction",
+                    string.Empty,
+                    DateTimeOffset.UtcNow,
+                    true,
+                    false,
+                    ["INBOX", "UNREAD"]);
+                await testStore.ApplyHistorySyncAsync(
+                    new GmailHistorySyncResult(100, 101, [thread], [], [thread]));
+                if (await testStore.GetHistoryCursorAsync() != 101
+                    || (await testStore.LoadThreadsAsync("INBOX", 5)).SingleOrDefault()?.Id != thread.Id)
+                {
+                    throw new InvalidOperationException("The encrypted history transaction did not persist its cursor and thread together.");
+                }
+
+                await testStore.ApplyHistorySyncAsync(
+                    new GmailHistorySyncResult(101, 102, [], [thread.Id], []));
+                if (await testStore.GetHistoryCursorAsync() != 102
+                    || (await testStore.LoadThreadsAsync("INBOX", 5)).Count != 0)
+                {
+                    throw new InvalidOperationException("The encrypted history transaction did not apply removal and cursor advancement together.");
+                }
+            }
+            finally
+            {
+                if (Directory.Exists(testDirectory))
+                {
+                    Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+                    Directory.Delete(testDirectory, recursive: true);
+                }
+            }
+
+            return "Encrypted history applies advance the cursor atomically; official history/thread quota weights and the 4,500-unit background budget are active.";
+        });
+
+        await RunCheckAsync(checks, "Multi-account and Board isolation", async () =>
+        {
+            var testDirectory = Path.Combine(
+                Path.GetTempPath(),
+                $"GLook-account-board-self-test-{Guid.NewGuid():N}");
+            try
+            {
+                var registry = new AccountRegistry(Path.Combine(testDirectory, "secure"));
+                var first = await registry.AddAsync(Guid.NewGuid(), "first@example.invalid", "First mailbox");
+                var second = await registry.AddAsync(Guid.NewGuid(), "second@example.invalid", "Second mailbox");
+                await registry.SetOrderAsync([second.AccountId, first.AccountId]);
+                var accounts = await registry.GetAccountsAsync();
+                if (accounts.Count != 2 || accounts[0].AccountId != second.AccountId)
+                {
+                    throw new InvalidOperationException("Account ordering or stable identities were not preserved.");
+                }
+
+                var coordinator = new GmailAccountSessionCoordinator(testDirectory);
+                var firstCredentialDirectory = registry.GetCredentialDirectory(first.AccountId);
+                Directory.CreateDirectory(firstCredentialDirectory);
+                var credentialMarkerPath = Path.Combine(firstCredentialDirectory, "rollback-marker.bin");
+                await File.WriteAllBytesAsync(credentialMarkerPath, [1, 2, 3], cancellationToken);
+                await coordinator.PreserveLegacyCredentialSnapshotAsync(first.AccountId, cancellationToken);
+                var legacyMarkerPath = Path.Combine(testDirectory, "secure", "rollback-marker.bin");
+                if (!File.Exists(legacyMarkerPath)
+                    || !File.ReadAllBytes(legacyMarkerPath).SequenceEqual(new byte[] { 1, 2, 3 }))
+                {
+                    throw new InvalidOperationException("The legacy credential rollback snapshot was not preserved.");
+                }
+
+                await coordinator.DisposeAsync();
+
+                var registryBytes = Directory.EnumerateFiles(
+                        Path.Combine(testDirectory, "secure", "account-registry"),
+                        "*.bin")
+                    .SelectMany(File.ReadAllBytes)
+                    .ToArray();
+                if (Encoding.UTF8.GetString(registryBytes).Contains("first@example.invalid", StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException("The account registry contained a plaintext email address.");
+                }
+
+                var boardStore = new BoardSettingsStore(Path.Combine(testDirectory, "boards"));
+                var (snapshot, board) = BoardConfigurationEditor.AddDefaultBoard(BoardSettingsSnapshot.Empty);
+                var inbox = board.Columns.Single(column => column.DisplayTitle == "Inbox");
+                snapshot = BoardConfigurationEditor.BindColumnToGmailLabel(
+                    snapshot,
+                    board.BoardId,
+                    first.AccountId,
+                    inbox.ColumnId,
+                    "INBOX");
+                snapshot = BoardConfigurationEditor.RenameColumn(
+                    snapshot,
+                    board.BoardId,
+                    inbox.ColumnId,
+                    "Incoming work");
+                await boardStore.SaveAsync(snapshot);
+                var loaded = await boardStore.LoadAsync();
+                var binding = loaded.AccountBindings.Single().ColumnBindings.Single();
+                var renamed = loaded.Boards.Single().Columns.Single(column => column.ColumnId == inbox.ColumnId);
+                if (renamed.DisplayTitle != "Incoming work" || binding.GmailLabelId != "INBOX")
+                {
+                    throw new InvalidOperationException("Renaming a Board heading changed or lost its Gmail label binding.");
+                }
+            }
+            finally
+            {
+                if (Directory.Exists(testDirectory))
+                {
+                    Directory.Delete(testDirectory, recursive: true);
+                }
+            }
+
+            return "Account identities and ordering persist in the encrypted registry; Board headings remain independent from per-account Gmail label bindings.";
         });
 
         await RunCheckAsync(checks, "Windows notification registration", () =>
@@ -177,10 +334,31 @@ public static class AppSelfTestRunner
                 throw new InvalidOperationException("No encrypted Gmail session was found for this Windows account.");
             }
 
-            localStore.SetAccountScope(profile.EmailAddress);
+            localStore.SetAccountScope(context.AccountScope ?? profile.EmailAddress);
 
             return $"Gmail profile loaded for {MaskEmail(profile.EmailAddress)}.";
         });
+
+        if (profile is not null)
+        {
+            await RunCheckAsync(checks, "Legacy rollback credential reconnects", async () =>
+            {
+                var legacyClient = new GmailClientService(new EncryptedDataStore(
+                    Path.Combine(appDataPath, "secure")));
+                var legacyProfile = await legacyClient.TryReconnectAsync(cancellationToken);
+                if (legacyProfile is null
+                    || !string.Equals(
+                        legacyProfile.EmailAddress,
+                        profile.EmailAddress,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        "The preserved single-account credential does not match the active mailbox.");
+                }
+
+                return $"Older single-account builds can still restore {MaskEmail(legacyProfile.EmailAddress)}.";
+            });
+        }
 
         IReadOnlyList<MailFolder> folders = [];
         IReadOnlyList<MailThreadSummary> threads = [];
@@ -277,13 +455,10 @@ public static class AppSelfTestRunner
         var startedAt = DateTimeOffset.Now;
         var checks = new List<AppSelfTestCheck>();
         var appDataPath = Path.GetDirectoryName(SyncAllReportPath)!;
-        var secureStore = new EncryptedDataStore(Path.Combine(appDataPath, "secure"));
-        var localStore = new LocalMailStore(Path.Combine(appDataPath, "mail.db"));
-        var signatureStore = new SignatureSettingsStore(secureStore);
-        var gmail = new GmailClientService(secureStore);
-        var viewModel = new MainViewModel(gmail, localStore, signatureStore);
+        var context = await CreateSelfTestContextAsync(appDataPath, cancellationToken);
+        var viewModel = new MainViewModel(context.Gmail, context.LocalStore, context.SignatureStore);
 
-        await RunCheckAsync(checks, "Sync all visible Gmail folders", async () =>
+        await RunCheckAsync(checks, "Sync Gmail history", async () =>
         {
             await viewModel.InitializeAsync(cancellationToken);
             if (!viewModel.IsConnected)
@@ -367,10 +542,9 @@ public static class AppSelfTestRunner
         var startedAt = DateTimeOffset.Now;
         var checks = new List<AppSelfTestCheck>();
         var appDataPath = Path.GetDirectoryName(LabelLifecycleReportPath)!;
-        var secureStore = new EncryptedDataStore(Path.Combine(appDataPath, "secure"));
-        var localStore = new LocalMailStore(Path.Combine(appDataPath, "mail.db"));
-        var gmail = new GmailClientService(secureStore);
-        var viewModel = new MainViewModel(gmail, localStore);
+        var context = await CreateSelfTestContextAsync(appDataPath, cancellationToken);
+        var gmail = context.Gmail;
+        var viewModel = new MainViewModel(gmail, context.LocalStore, context.SignatureStore);
         var uniqueRoot = $"GLook Verification {DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}"[..54];
         var childPath = $"{uniqueRoot}/Nested label";
         var renamedRoot = $"{uniqueRoot} renamed";
@@ -472,8 +646,8 @@ public static class AppSelfTestRunner
         var startedAt = DateTimeOffset.Now;
         var checks = new List<AppSelfTestCheck>();
         var appDataPath = Path.GetDirectoryName(MailActionReportPath)!;
-        var secureStore = new EncryptedDataStore(Path.Combine(appDataPath, "secure"));
-        var gmail = new GmailClientService(secureStore);
+        var context = await CreateSelfTestContextAsync(appDataPath, cancellationToken);
+        var gmail = context.Gmail;
         GmailAccountProfile? profile = null;
         string? draftId = null;
 
@@ -591,6 +765,30 @@ public static class AppSelfTestRunner
         return report;
     }
 
+    private static async Task<SelfTestContext> CreateSelfTestContextAsync(
+        string appDataPath,
+        CancellationToken cancellationToken)
+    {
+        var secureRoot = Path.Combine(appDataPath, "secure");
+        var registry = new AccountRegistry(secureRoot);
+        var account = (await registry.GetAccountsAsync(cancellationToken)).FirstOrDefault();
+        var secureStore = new EncryptedDataStore(account is null
+            ? secureRoot
+            : registry.GetCredentialDirectory(account.AccountId));
+        var localStore = new LocalMailStore(Path.Combine(appDataPath, "mail.db"));
+        var accountScope = account?.AccountId.ToString("D");
+        if (accountScope is not null)
+        {
+            localStore.SetAccountScope(accountScope);
+        }
+
+        return new SelfTestContext(
+            new GmailClientService(secureStore),
+            localStore,
+            new SignatureSettingsStore(secureStore),
+            accountScope);
+    }
+
     private static async Task RunCheckAsync(
         ICollection<AppSelfTestCheck> checks,
         string name,
@@ -689,4 +887,10 @@ public static class AppSelfTestRunner
 
         return $"{email[0]}***{email[separator..]}";
     }
+
+    private sealed record SelfTestContext(
+        GmailClientService Gmail,
+        LocalMailStore LocalStore,
+        SignatureSettingsStore SignatureStore,
+        string? AccountScope);
 }

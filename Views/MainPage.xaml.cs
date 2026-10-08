@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using GLook.Models;
@@ -34,10 +35,7 @@ public sealed partial class MainPage : Page
     private const double MinimumReadingPaneHeight = 240;
     private bool isCompact;
     private bool composeDialogOpen;
-    private bool notificationPollInProgress;
     private bool autoSyncInProgress;
-    private bool notificationBaselineEstablished;
-    private readonly HashSet<string> knownUnreadInboxThreads = new(StringComparer.Ordinal);
     private DispatcherQueueTimer? autoSyncTimer;
     private bool autoSyncEnabled = true;
     private int autoSyncIntervalMinutes = DefaultAutoSyncIntervalMinutes;
@@ -48,6 +46,7 @@ public sealed partial class MainPage : Page
     private bool showMessageListToolbar = true;
     private bool showMessagePreview = true;
     private bool showSenderAvatars = true;
+    private MailViewMode mailViewMode = MailViewMode.List;
     private bool isRebuildingThreadView;
     private bool isUpdatingThreadSelectionBoxes;
     private bool messageWebViewInitialized;
@@ -66,15 +65,28 @@ public sealed partial class MainPage : Page
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "GLook",
         "ui-settings.json");
+    private readonly string appDataPath;
+    private readonly string legacySecurePath;
+    private readonly GmailAccountSessionCoordinator accountCoordinator;
+    private readonly BoardSettingsStore boardSettingsStore = BoardSettingsStore.CreateDefault();
+    private readonly List<GmailAccountRegistration> connectedAccounts = [];
+    private readonly Dictionary<Guid, IReadOnlyList<MailFolder>> accountFolderSnapshots = [];
+    private readonly HashSet<Guid> initializedMailboxTrees = [];
+    private Guid? activeAccountId;
+    private bool accountCoordinatorInitialized;
+    private int boardProjectionVersion;
+    private CancellationTokenSource? allAccountsSyncCancellation;
 
-    public MainViewModel ViewModel { get; }
+    public MainViewModel ViewModel { get; private set; }
 
     public MainPage()
     {
-        var appDataPath = Path.Combine(
+        appDataPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "GLook");
-        var secureStore = new EncryptedDataStore(Path.Combine(appDataPath, "secure"));
+        legacySecurePath = Path.Combine(appDataPath, "secure");
+        accountCoordinator = new GmailAccountSessionCoordinator(appDataPath);
+        var secureStore = new EncryptedDataStore(legacySecurePath);
         var gmail = new GmailClientService(secureStore);
         var localStore = new LocalMailStore(Path.Combine(appDataPath, "mail.db"));
         var signatureStore = new SignatureSettingsStore(secureStore);
@@ -83,23 +95,29 @@ public sealed partial class MainPage : Page
         InitializeComponent();
         DataContext = ViewModel;
         ComposeDialog.DataContext = ViewModel;
+        BoardWorkspace.SettingsStore = boardSettingsStore;
+        BoardWorkspace.MailboxChanged += BoardWorkspace_MailboxChanged;
+        BoardWorkspace.ColumnBindingRequested += BoardWorkspace_ColumnBindingRequested;
+        BoardWorkspace.CardOpenRequested += BoardWorkspace_CardOpenRequested;
+        BoardWorkspace.CardActionRequested += BoardWorkspace_CardActionRequested;
+        BoardWorkspace.ManageBoardRequested += BoardWorkspace_ManageBoardRequested;
         threadGroupsSource.Source = threadGroups;
-        ViewModel.Threads.CollectionChanged += (_, _) => RebuildThreadView();
+        AttachViewModelEvents(ViewModel);
         LoadUiSettings();
         ApplyDensity();
         UpdateViewOptionChecks();
         ApplyMessageListViewOptions();
         RebuildThreadView();
-        ViewModel.PropertyChanged += ViewModel_PropertyChanged;
         UpdateSyncProgressIndicator();
     }
 
     private async void Page_Loaded(object sender, RoutedEventArgs e)
     {
-        await ViewModel.InitializeAsync();
+        await InitializeAccountsAsync();
+        await InitializeBoardAsync();
         UpdateContentPanels();
         SyncFolderTree();
-        await PollForNewMailAsync();
+        await PublishHistoryNotificationsAsync(ViewModel, activeAccountId);
         StartAutoSyncTimer();
     }
 
@@ -108,6 +126,447 @@ public sealed partial class MainPage : Page
         autoSyncTimer?.Stop();
         autoSyncTimer = null;
         SaveUiSettings();
+    }
+
+    private void AttachViewModelEvents(MainViewModel viewModel)
+    {
+        viewModel.Threads.CollectionChanged += ViewModelThreads_CollectionChanged;
+        viewModel.PropertyChanged += ViewModel_PropertyChanged;
+    }
+
+    private void DetachViewModelEvents(MainViewModel viewModel)
+    {
+        viewModel.Threads.CollectionChanged -= ViewModelThreads_CollectionChanged;
+        viewModel.PropertyChanged -= ViewModel_PropertyChanged;
+    }
+
+    private void ViewModelThreads_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        RebuildThreadView();
+        _ = RefreshBoardCardsAsync();
+    }
+
+    private async Task InitializeAccountsAsync()
+    {
+        await accountCoordinator.InitializeAsync();
+        accountCoordinatorInitialized = true;
+        await RefreshConnectedAccountsAsync();
+
+        if (connectedAccounts.Count == 0)
+        {
+            await ViewModel.InitializeAsync();
+            if (ViewModel.IsConnected)
+            {
+                var migrated = await MigrateLegacyAccountAsync(ViewModel.AccountEmail);
+                await RefreshConnectedAccountsAsync();
+                await SwitchToAccountAsync(migrated.AccountId, initialize: true);
+            }
+
+            return;
+        }
+
+        await accountCoordinator.PreserveLegacyCredentialSnapshotAsync(connectedAccounts[0].AccountId);
+        await SwitchToAccountAsync(connectedAccounts[0].AccountId, initialize: true);
+    }
+
+    private async Task<GmailAccountRegistration> MigrateLegacyAccountAsync(string emailAddress)
+    {
+        var existing = await accountCoordinator.Registry.FindByEmailAsync(emailAddress);
+        if (existing is not null)
+        {
+            return existing;
+        }
+
+        var accountId = Guid.NewGuid();
+        var credentialDirectory = accountCoordinator.Registry.GetCredentialDirectory(accountId);
+        Directory.CreateDirectory(credentialDirectory);
+        foreach (var sourcePath in Directory.EnumerateFiles(legacySecurePath, "*.bin", SearchOption.TopDirectoryOnly))
+        {
+            var destinationPath = Path.Combine(credentialDirectory, Path.GetFileName(sourcePath));
+            File.Copy(sourcePath, destinationPath, overwrite: false);
+        }
+
+        return await accountCoordinator.Registry.AddAsync(accountId, emailAddress);
+    }
+
+    private async Task RefreshConnectedAccountsAsync()
+    {
+        var accounts = await accountCoordinator.GetAccountsAsync();
+        connectedAccounts.Clear();
+        connectedAccounts.AddRange(accounts);
+    }
+
+    private async Task SwitchToAccountAsync(Guid accountId, bool initialize)
+    {
+        if (activeAccountId == accountId && (!initialize || ViewModel.IsConnected))
+        {
+            return;
+        }
+
+        if (activeAccountId is Guid previousAccountId && ViewModel.Folders.Count > 0)
+        {
+            accountFolderSnapshots[previousAccountId] = ViewModel.Folders.ToArray();
+        }
+
+        var session = await accountCoordinator.GetSessionAsync(accountId);
+        var replacement = new MainViewModel(
+            session.Gmail,
+            session.MailStore,
+            session.SignatureSettings,
+            session.LifetimeToken,
+            session.OperationGate);
+        DetachViewModelEvents(ViewModel);
+        ViewModel = replacement;
+        activeAccountId = accountId;
+        DataContext = replacement;
+        ComposeDialog.DataContext = replacement;
+        AttachViewModelEvents(replacement);
+        selectedThreadIds.Clear();
+        collapsedThreadGroups.Clear();
+        threadGroups.Clear();
+        renderedThreadId = null;
+
+        if (initialize)
+        {
+            await replacement.InitializeAsync();
+        }
+
+        accountFolderSnapshots[accountId] = replacement.Folders.ToArray();
+
+        RebuildThreadView();
+        UpdateContentPanels();
+        SyncFolderTree();
+        UpdateSyncProgressIndicator();
+        await UpdateBoardMailboxesAsync();
+        await RefreshBoardCardsAsync();
+    }
+
+    private async Task InitializeBoardAsync()
+    {
+        await BoardWorkspace.LoadAsync();
+        await UpdateBoardMailboxesAsync();
+        await EnsureInboxBoardBindingsAsync();
+        await RefreshBoardCardsAsync();
+        ApplyMailViewMode();
+    }
+
+    private async Task UpdateBoardMailboxesAsync()
+    {
+        await RefreshConnectedAccountsAsync();
+        await BoardWorkspace.SetMailboxesAsync(connectedAccounts.Select(account =>
+            new BoardMailboxOption(account.AccountId, account.DisplayName, account.EmailAddress)));
+    }
+
+    private async Task EnsureInboxBoardBindingsAsync()
+    {
+        if (BoardWorkspace.ActiveBoard is not { } board)
+        {
+            return;
+        }
+
+        var inboxColumn = board.Columns.FirstOrDefault(column =>
+            string.Equals(column.DisplayTitle, "Inbox", StringComparison.OrdinalIgnoreCase));
+        if (inboxColumn is null)
+        {
+            return;
+        }
+
+        var snapshot = BoardWorkspace.Configuration;
+        var changed = false;
+        foreach (var account in connectedAccounts)
+        {
+            var alreadyBound = snapshot.AccountBindings.Any(binding =>
+                binding.BoardId == board.BoardId
+                && binding.AccountId == account.AccountId
+                && binding.ColumnBindings.Any(column => column.ColumnId == inboxColumn.ColumnId));
+            if (!alreadyBound)
+            {
+                snapshot = BoardConfigurationEditor.BindColumnToGmailLabel(
+                    snapshot,
+                    board.BoardId,
+                    account.AccountId,
+                    inboxColumn.ColumnId,
+                    "INBOX");
+                changed = true;
+            }
+        }
+
+        if (changed)
+        {
+            await boardSettingsStore.SaveAsync(snapshot);
+            BoardWorkspace.SetConfiguration(snapshot, board.BoardId);
+        }
+    }
+
+    private async Task RefreshBoardCardsAsync()
+    {
+        var projectionVersion = Interlocked.Increment(ref boardProjectionVersion);
+        if (BoardWorkspace.ActiveBoard is not { } board
+            || BoardWorkspace.SelectedAccountId is not Guid accountId)
+        {
+            BoardWorkspace.SetCards([]);
+            return;
+        }
+
+        var account = connectedAccounts.FirstOrDefault(candidate => candidate.AccountId == accountId);
+        var bindings = BoardWorkspace.Configuration.AccountBindings
+            .FirstOrDefault(binding => binding.BoardId == board.BoardId && binding.AccountId == accountId);
+        if (account is null || bindings is null)
+        {
+            BoardWorkspace.SetCards([]);
+            return;
+        }
+
+        var session = await accountCoordinator.GetSessionAsync(accountId);
+        var cards = new List<BoardCardItem>();
+        foreach (var binding in bindings.ColumnBindings)
+        {
+            var laneThreads = await session.MailStore.LoadThreadsAsync(binding.GmailLabelId, 200);
+            cards.AddRange(laneThreads.Select(thread => new BoardCardItem(
+                accountId,
+                thread.Id,
+                binding.ColumnId,
+                account.DisplayName,
+                thread.Sender,
+                thread.Subject,
+                thread.Snippet,
+                thread.ReceivedText,
+                thread.IsUnread)));
+        }
+
+        if (projectionVersion == boardProjectionVersion)
+        {
+            BoardWorkspace.SetCards(cards
+                .DistinctBy(card => (card.AccountId, card.ThreadId, card.ColumnId))
+                .ToArray());
+        }
+    }
+
+    private async void BoardWorkspace_MailboxChanged(object? sender, BoardMailboxChangedEventArgs e)
+    {
+        try
+        {
+            await SwitchToAccountAsync(e.AccountId, initialize: true);
+            var inbox = ViewModel.Folders.FirstOrDefault(folder => folder.Id == "INBOX");
+            if (inbox is not null)
+            {
+                await ViewModel.SelectFolderAsync(inbox);
+            }
+
+            await RefreshBoardCardsAsync();
+        }
+        catch (Exception ex)
+        {
+            BoardWorkspace.AnnounceStatus($"Could not switch mailbox: {ex.GetBaseException().Message}");
+        }
+    }
+
+    private async void BoardWorkspace_ColumnBindingRequested(
+        object? sender,
+        BoardColumnBindingRequestedEventArgs e)
+    {
+        try
+        {
+            if (activeAccountId != e.AccountId)
+            {
+                await SwitchToAccountAsync(e.AccountId, initialize: true);
+            }
+
+            var labels = ViewModel.Folders
+                .Where(folder => folder.Id is not "CHAT" && folder.Id is not "CATEGORY_FORUMS")
+                .OrderBy(folder => folder.IsSystem ? 0 : 1)
+                .ThenBy(folder => folder.FullName, StringComparer.CurrentCultureIgnoreCase)
+                .ToArray();
+            var selector = new ComboBox
+            {
+                Header = "Existing Gmail label",
+                MinWidth = 360,
+                ItemsSource = labels,
+                DisplayMemberPath = nameof(MailFolder.FullName),
+                SelectedItem = labels.FirstOrDefault()
+            };
+            var createBox = new TextBox
+            {
+                Header = "Or create a new Gmail label",
+                PlaceholderText = "Workflow/Needs reply",
+                MaxLength = 225
+            };
+            var content = new StackPanel { Spacing = 12 };
+            content.Children.Add(selector);
+            content.Children.Add(createBox);
+            content.Children.Add(new TextBlock
+            {
+                Text = "A new label name takes precedence over the existing-label selection.",
+                Style = (Style)Application.Current.Resources["GLookMetadataStyle"],
+                TextWrapping = TextWrapping.Wrap
+            });
+            var dialog = new ContentDialog
+            {
+                XamlRoot = XamlRoot,
+                Title = "Map board column",
+                Content = content,
+                PrimaryButtonText = "Map label",
+                CloseButtonText = "Cancel",
+                DefaultButton = ContentDialogButton.Primary
+            };
+            if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+            {
+                return;
+            }
+
+            MailFolder? label;
+            if (!string.IsNullOrWhiteSpace(createBox.Text))
+            {
+                await ViewModel.CreateFolderAsync(createBox.Text.Trim());
+                label = ViewModel.Folders.FirstOrDefault(folder =>
+                    string.Equals(folder.FullName, createBox.Text.Trim(), StringComparison.OrdinalIgnoreCase));
+            }
+            else
+            {
+                label = selector.SelectedItem as MailFolder;
+            }
+
+            if (label is null || BoardWorkspace.ActiveBoard is not { } board)
+            {
+                BoardWorkspace.AnnounceStatus("Choose an existing label or enter a new label name.");
+                return;
+            }
+
+            var updated = BoardConfigurationEditor.BindColumnToGmailLabel(
+                BoardWorkspace.Configuration,
+                board.BoardId,
+                e.AccountId,
+                e.ColumnId,
+                label.Id);
+            await boardSettingsStore.SaveAsync(updated);
+            BoardWorkspace.SetConfiguration(updated, board.BoardId);
+            await ViewModel.SelectFolderAsync(label);
+            var inbox = ViewModel.Folders.FirstOrDefault(folder => folder.Id == "INBOX");
+            if (inbox is not null && label.Id != inbox.Id)
+            {
+                await ViewModel.SelectFolderAsync(inbox);
+            }
+
+            await RefreshBoardCardsAsync();
+            BoardWorkspace.AnnounceStatus($"Column mapped to Gmail label {label.FullName}.");
+        }
+        catch (Exception ex)
+        {
+            BoardWorkspace.AnnounceStatus($"Could not map the label: {ex.GetBaseException().Message}");
+        }
+    }
+
+    private async void BoardWorkspace_CardOpenRequested(object? sender, BoardCardRequestedEventArgs e)
+    {
+        if (activeAccountId != e.Card.AccountId)
+        {
+            await SwitchToAccountAsync(e.Card.AccountId, initialize: true);
+        }
+
+        var session = await accountCoordinator.GetSessionAsync(e.Card.AccountId);
+        var thread = ViewModel.Threads.FirstOrDefault(candidate => candidate.Id == e.Card.ThreadId)
+            ?? await session.MailStore.LoadThreadAsync(e.Card.ThreadId);
+        if (thread is null)
+        {
+            BoardWorkspace.AnnounceStatus("That conversation is not in the current local mirror yet.");
+            return;
+        }
+
+        await ViewModel.SelectThreadAsync(thread);
+        SetMailViewMode(MailViewMode.List);
+    }
+
+    private async void BoardWorkspace_CardActionRequested(
+        object? sender,
+        BoardCardActionRequestedEventArgs e)
+    {
+        try
+        {
+            if (activeAccountId != e.Card.AccountId)
+            {
+                await SwitchToAccountAsync(e.Card.AccountId, initialize: true);
+            }
+
+            var session = await accountCoordinator.GetSessionAsync(e.Card.AccountId);
+            var thread = ViewModel.Threads.FirstOrDefault(candidate => candidate.Id == e.Card.ThreadId)
+                ?? await session.MailStore.LoadThreadAsync(e.Card.ThreadId)
+                ?? throw new InvalidOperationException("The conversation is not available in the local mirror.");
+            var target = ViewModel.Folders.FirstOrDefault(folder => folder.Id == e.TargetGmailLabelId)
+                ?? throw new InvalidOperationException("The target Gmail label is not available.");
+            await ViewModel.ApplyBoardLabelsAsync(
+                thread,
+                e.TargetGmailLabelId,
+                e.SourceGmailLabelId,
+                e.Behavior == BoardDragBehavior.Move);
+
+            await RefreshBoardCardsAsync();
+            BoardWorkspace.AnnounceStatus(
+                e.Behavior == BoardDragBehavior.Move
+                    ? $"Moved {thread.Subject} to {target.FullName}."
+                    : $"Added {target.FullName} to {thread.Subject}.");
+        }
+        catch (Exception ex)
+        {
+            BoardWorkspace.AnnounceStatus($"Gmail rejected the board change: {ex.GetBaseException().Message}");
+        }
+    }
+
+    private async void BoardWorkspace_ManageBoardRequested(object? sender, EventArgs e)
+    {
+        if (BoardWorkspace.ActiveBoard is not { } board)
+        {
+            return;
+        }
+
+        var newColumnBox = new TextBox
+        {
+            Header = "New workflow column",
+            PlaceholderText = "For example: Follow up",
+            MaxLength = BoardConfigurationValidator.MaximumColumnTitleLength
+        };
+        var content = new StackPanel { Spacing = 12 };
+        content.Children.Add(new TextBlock
+        {
+            Text = "Rename a column with its pencil button. Column headings are independent from Gmail label names.",
+            TextWrapping = TextWrapping.Wrap
+        });
+        content.Children.Add(new TextBlock
+        {
+            Text = "Current columns: " + string.Join("  ·  ", board.Columns.OrderBy(column => column.Position).Select(column => column.DisplayTitle)),
+            Style = (Style)Application.Current.Resources["GLookMetadataStyle"],
+            TextWrapping = TextWrapping.Wrap
+        });
+        content.Children.Add(newColumnBox);
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "Manage board",
+            Content = content,
+            PrimaryButtonText = "Add column",
+            CloseButtonText = "Close",
+            DefaultButton = ContentDialogButton.Primary
+        };
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary
+            || string.IsNullOrWhiteSpace(newColumnBox.Text))
+        {
+            return;
+        }
+
+        try
+        {
+            var updated = BoardConfigurationEditor.AddColumn(
+                BoardWorkspace.Configuration,
+                board.BoardId,
+                newColumnBox.Text);
+            await boardSettingsStore.SaveAsync(updated);
+            BoardWorkspace.SetConfiguration(updated, board.BoardId);
+            await RefreshBoardCardsAsync();
+            BoardWorkspace.AnnounceStatus($"Added column {newColumnBox.Text.Trim()}.");
+        }
+        catch (Exception ex)
+        {
+            BoardWorkspace.AnnounceStatus($"Could not add the column: {ex.GetBaseException().Message}");
+        }
     }
 
     private void Page_SizeChanged(object sender, SizeChangedEventArgs e)
@@ -161,11 +620,21 @@ public sealed partial class MainPage : Page
 
         try
         {
-            await ViewModel.ConnectAsync();
+            if (accountCoordinatorInitialized && connectedAccounts.Count == 0)
+            {
+                var registration = await accountCoordinator.AddAccountAsync();
+                await RefreshConnectedAccountsAsync();
+                await SwitchToAccountAsync(registration.AccountId, initialize: true);
+                await UpdateBoardMailboxesAsync();
+                await EnsureInboxBoardBindingsAsync();
+            }
+            else
+            {
+                await ViewModel.ConnectAsync();
+            }
+
             SyncFolderTree();
-            notificationBaselineEstablished = false;
-            knownUnreadInboxThreads.Clear();
-            await PollForNewMailAsync();
+            await PublishHistoryNotificationsAsync(ViewModel, activeAccountId);
             StartAutoSyncTimer();
         }
         catch (Exception ex)
@@ -178,25 +647,20 @@ public sealed partial class MainPage : Page
     {
         await ViewModel.RefreshAsync();
         SyncFolderTree();
-        await PollForNewMailAsync();
+        await PublishHistoryNotificationsAsync(ViewModel, activeAccountId);
         StartAutoSyncTimer();
     }
 
     private async void SyncAll_Click(object sender, RoutedEventArgs e)
     {
-        var succeeded = await ViewModel.SyncAllAsync();
-        SyncFolderTree();
-        UpdateContentPanels();
-        if (succeeded)
-        {
-            await PollForNewMailAsync();
-        }
-
-        StartAutoSyncTimer();
+        await SyncEnabledAccountsAsync(showProgress: true);
     }
 
-    private void CancelSyncAll_Click(object sender, RoutedEventArgs e) =>
+    private void CancelSyncAll_Click(object sender, RoutedEventArgs e)
+    {
+        allAccountsSyncCancellation?.Cancel();
         ViewModel.CancelSyncAll();
+    }
 
     private async void FolderTree_ItemInvoked(TreeView sender, TreeViewItemInvokedEventArgs args)
     {
@@ -209,9 +673,33 @@ public sealed partial class MainPage : Page
             _ => null
         };
 
+        if (treeItem?.IsMailboxRoot == true && treeItem.AccountId is Guid accountId)
+        {
+            await SwitchToAccountAsync(accountId, initialize: true);
+            var inbox = ViewModel.Folders.FirstOrDefault(folder => folder.Id == "INBOX");
+            if (inbox is not null)
+            {
+                await ViewModel.SelectFolderAsync(inbox);
+            }
+
+            SyncFolderTree();
+            if (FolderSplitView.DisplayMode == SplitViewDisplayMode.Overlay)
+            {
+                FolderSplitView.IsPaneOpen = false;
+            }
+
+            return;
+        }
+
         if (treeItem?.Folder is not { } folder)
         {
             return;
+        }
+
+        if (treeItem.AccountId is Guid folderAccountId && folderAccountId != activeAccountId)
+        {
+            await SwitchToAccountAsync(folderAccountId, initialize: true);
+            folder = ViewModel.Folders.FirstOrDefault(candidate => candidate.Id == folder.Id) ?? folder;
         }
 
         await ViewModel.SelectFolderAsync(folder);
@@ -243,16 +731,20 @@ public sealed partial class MainPage : Page
         var treeItem = contextFolderNode?.Content as FolderTreeItem;
         var folder = treeItem?.Folder;
         var hasBranch = contextFolderNode?.HasChildren == true;
-        var isUserLabelPath = treeItem is not null && folder?.IsSystem != true;
+        var isActiveItem = treeItem?.AccountId is null || treeItem.AccountId == activeAccountId;
+        var isUserLabelPath = treeItem is not null
+            && !treeItem.IsMailboxRoot
+            && !treeItem.IsPlaceholder
+            && folder?.IsSystem != true;
 
-        ContextOpenFolderItem.IsEnabled = folder is not null;
-        ContextNewSubfolderItem.IsEnabled = ViewModel.IsConnected && isUserLabelPath;
-        ContextRenameFolderItem.IsEnabled = ViewModel.IsConnected && folder?.CanDelete == true;
-        ContextDeleteFolderItem.IsEnabled = ViewModel.IsConnected && folder?.CanDelete == true;
+        ContextOpenFolderItem.IsEnabled = folder is not null || treeItem?.IsMailboxRoot == true;
+        ContextNewSubfolderItem.IsEnabled = ViewModel.IsConnected && isActiveItem && isUserLabelPath;
+        ContextRenameFolderItem.IsEnabled = ViewModel.IsConnected && isActiveItem && folder?.CanDelete == true;
+        ContextDeleteFolderItem.IsEnabled = ViewModel.IsConnected && isActiveItem && folder?.CanDelete == true;
         ContextEmptyTrashItem.Visibility = folder?.Id == "TRASH"
             ? Visibility.Visible
             : Visibility.Collapsed;
-        ContextEmptyTrashItem.IsEnabled = ViewModel.IsConnected && !ViewModel.IsBusy;
+        ContextEmptyTrashItem.IsEnabled = ViewModel.IsConnected && isActiveItem && !ViewModel.IsBusy;
         ContextExpandBranchItem.IsEnabled = hasBranch;
         ContextCollapseBranchItem.IsEnabled = hasBranch;
     }
@@ -265,9 +757,22 @@ public sealed partial class MainPage : Page
 
     private async void OpenFolder_Click(object sender, RoutedEventArgs e)
     {
-        if (GetContextFolderItem()?.Folder is not { } folder)
+        var item = GetContextFolderItem();
+        if (item?.IsMailboxRoot == true && item.AccountId is Guid accountId)
+        {
+            await SwitchToAccountAsync(accountId, initialize: true);
+            return;
+        }
+
+        if (item?.Folder is not { } folder)
         {
             return;
+        }
+
+        if (item.AccountId is Guid folderAccountId && folderAccountId != activeAccountId)
+        {
+            await SwitchToAccountAsync(folderAccountId, initialize: true);
+            folder = ViewModel.Folders.FirstOrDefault(candidate => candidate.Id == folder.Id) ?? folder;
         }
 
         await ViewModel.SelectFolderAsync(folder);
@@ -719,29 +1224,128 @@ public sealed partial class MainPage : Page
 
     private async void Account_Click(object sender, RoutedEventArgs e)
     {
-        if (!ViewModel.IsConnected)
+        if (!accountCoordinatorInitialized)
         {
             Connect_Click(sender, e);
             return;
         }
 
+        var accountsView = new AccountsSettingsView();
+        await accountsView.InitializeAsync(accountCoordinator);
+        accountsView.AccountRegistrationChanged += async (_, _) =>
+        {
+            await RefreshConnectedAccountsAsync();
+            SyncFolderTree();
+            await UpdateBoardMailboxesAsync();
+        };
+        accountsView.AddAccountRequested += async (_, _) =>
+        {
+            try
+            {
+                var added = await accountCoordinator.AddAccountAsync();
+                await accountsView.RefreshAsync();
+                await RefreshConnectedAccountsAsync();
+                await SwitchToAccountAsync(added.AccountId, initialize: true);
+                await UpdateBoardMailboxesAsync();
+                await EnsureInboxBoardBindingsAsync();
+            }
+            catch (Exception ex)
+            {
+                accountsView.AnnounceError("Could not add Gmail account", ex.GetBaseException().Message);
+            }
+        };
+        accountsView.ReauthorizeAccountRequested += async (_, args) =>
+        {
+            try
+            {
+                var session = await accountCoordinator.GetSessionAsync(args.Account.AccountId);
+                await session.Gmail.DisconnectAsync();
+                var profile = await session.Gmail.ConnectAsync();
+                if (!string.Equals(profile.EmailAddress, args.Account.EmailAddress, StringComparison.OrdinalIgnoreCase))
+                {
+                    await session.Gmail.DisconnectAsync();
+                    throw new InvalidOperationException(
+                        $"Google authorized {profile.EmailAddress}, but this mailbox is {args.Account.EmailAddress}.");
+                }
+
+                await accountCoordinator.UpdateAccountSyncStatusAsync(
+                    args.Account.AccountId,
+                    GmailAccountSyncState.Ready,
+                    args.Account.LastSuccessfulSyncAt,
+                    lastSyncError: null);
+                if (activeAccountId == args.Account.AccountId)
+                {
+                    await SwitchToAccountAsync(args.Account.AccountId, initialize: true);
+                }
+
+                await accountsView.RefreshAsync();
+            }
+            catch (Exception ex)
+            {
+                accountsView.AnnounceError("Gmail reauthorization failed", ex.GetBaseException().Message);
+            }
+        };
+        accountsView.RemoveAccountRequested += async (_, args) =>
+        {
+            try
+            {
+                var removingActive = activeAccountId == args.Account.AccountId;
+                await accountCoordinator.RemoveAccountAsync(args.Account.AccountId);
+                accountFolderSnapshots.Remove(args.Account.AccountId);
+                initializedMailboxTrees.Remove(args.Account.AccountId);
+                await RefreshConnectedAccountsAsync();
+                if (removingActive)
+                {
+                    if (connectedAccounts.Count > 0)
+                    {
+                        await SwitchToAccountAsync(connectedAccounts[0].AccountId, initialize: true);
+                    }
+                    else
+                    {
+                        SwitchToDisconnectedViewModel();
+                    }
+                }
+
+                await accountsView.RefreshAsync();
+                await UpdateBoardMailboxesAsync();
+                SyncFolderTree();
+            }
+            catch (Exception ex)
+            {
+                accountsView.AnnounceError("Could not remove Gmail account", ex.GetBaseException().Message);
+            }
+        };
+
         var dialog = new ContentDialog
         {
             XamlRoot = XamlRoot,
-            Title = ViewModel.AccountEmail,
-            Content = "Disconnecting removes the encrypted OAuth session from this PC. Your Gmail data is not changed.",
-            PrimaryButtonText = "Disconnect",
-            CloseButtonText = "Keep connected",
+            Title = "Gmail accounts",
+            Content = accountsView,
+            CloseButtonText = "Done",
             DefaultButton = ContentDialogButton.Close
         };
+        await dialog.ShowAsync();
+    }
 
-        if (await dialog.ShowAsync() == ContentDialogResult.Primary)
-        {
-            await ViewModel.DisconnectAsync();
-            notificationBaselineEstablished = false;
-            knownUnreadInboxThreads.Clear();
-            SyncFolderTree();
-        }
+    private void SwitchToDisconnectedViewModel()
+    {
+        var disconnectedSecurePath = Path.Combine(appDataPath, "secure", "disconnected-session");
+        var secureStore = new EncryptedDataStore(disconnectedSecurePath);
+        var replacement = new MainViewModel(
+            new GmailClientService(secureStore),
+            new LocalMailStore(Path.Combine(appDataPath, "mail.db")),
+            new SignatureSettingsStore(secureStore));
+        DetachViewModelEvents(ViewModel);
+        ViewModel = replacement;
+        activeAccountId = null;
+        DataContext = replacement;
+        ComposeDialog.DataContext = replacement;
+        AttachViewModelEvents(replacement);
+        threadGroups.Clear();
+        selectedThreadIds.Clear();
+        UpdateContentPanels();
+        SyncFolderTree();
+        _ = RefreshBoardCardsAsync();
     }
 
     private async void Settings_Click(object sender, RoutedEventArgs e)
@@ -824,7 +1428,12 @@ public sealed partial class MainPage : Page
         syncSection.Children.Add(intervalBox);
         syncSection.Children.Add(new TextBlock
         {
-            Text = "Automatic sync refreshes the selected folder and checks for new Inbox mail while GLook is running.",
+            Text = "Automatic sync checks Gmail history for every enabled mailbox while GLook is running. Folder navigation reads the encrypted local mirror instead of refreshing every label.",
+            TextWrapping = TextWrapping.Wrap
+        });
+        syncSection.Children.Add(new TextBlock
+        {
+            Text = $"Current mailbox quota guard: {ViewModel.QuotaSnapshot.RollingMinuteUnits:N0} of {ViewModel.QuotaSnapshot.BackgroundMinuteBudget:N0} background units this minute ({ViewModel.QuotaSnapshot.State}).",
             TextWrapping = TextWrapping.Wrap
         });
 
@@ -1531,6 +2140,31 @@ public sealed partial class MainPage : Page
     private void ReadingPaneRight_Click(object sender, RoutedEventArgs e) => SetReadingPaneMode(ReadingPaneMode.Right);
     private void ReadingPaneBottom_Click(object sender, RoutedEventArgs e) => SetReadingPaneMode(ReadingPaneMode.Bottom);
     private void ReadingPaneOff_Click(object sender, RoutedEventArgs e) => SetReadingPaneMode(ReadingPaneMode.Off);
+    private void ListViewMode_Click(object sender, RoutedEventArgs e) => SetMailViewMode(MailViewMode.List);
+    private async void BoardViewMode_Click(object sender, RoutedEventArgs e) => await ShowBoardViewAsync();
+
+    private async void ToggleMailViewMode_Click(object sender, RoutedEventArgs e)
+    {
+        if (mailViewMode == MailViewMode.Board)
+        {
+            SetMailViewMode(MailViewMode.List);
+            return;
+        }
+
+        await ShowBoardViewAsync();
+    }
+
+    private async Task ShowBoardViewAsync()
+    {
+        var inbox = ViewModel.Folders.FirstOrDefault(folder => folder.Id == "INBOX");
+        if (inbox is not null && ViewModel.SelectedFolder?.Id != "INBOX")
+        {
+            await ViewModel.SelectFolderAsync(inbox);
+            await PublishHistoryNotificationsAsync(ViewModel, activeAccountId);
+        }
+
+        SetMailViewMode(MailViewMode.Board);
+    }
     private void ComfortableDensity_Click(object sender, RoutedEventArgs e) => SetDensity(MessageDensity.Comfortable);
     private void CompactDensity_Click(object sender, RoutedEventArgs e) => SetDensity(MessageDensity.Compact);
 
@@ -1540,6 +2174,31 @@ public sealed partial class MainPage : Page
         UpdateViewOptionChecks();
         ApplyReadingLayout();
         SaveUiSettings();
+    }
+
+    private void SetMailViewMode(MailViewMode mode)
+    {
+        mailViewMode = mode;
+        ApplyMailViewMode();
+        UpdateViewOptionChecks();
+        SaveUiSettings();
+    }
+
+    private void ApplyMailViewMode()
+    {
+        var showBoard = mailViewMode == MailViewMode.Board;
+        BoardWorkspace.Visibility = showBoard ? Visibility.Visible : Visibility.Collapsed;
+        ThreadListPane.Visibility = showBoard ? Visibility.Collapsed : Visibility.Visible;
+        MessageResizeThumb.Visibility = showBoard ? Visibility.Collapsed : Visibility.Visible;
+        ReadingPane.Visibility = showBoard ? Visibility.Collapsed : Visibility.Visible;
+        if (showBoard)
+        {
+            _ = RefreshBoardCardsAsync();
+        }
+        else
+        {
+            ApplyReadingLayout();
+        }
     }
 
     private void SetDensity(MessageDensity density)
@@ -1560,6 +2219,14 @@ public sealed partial class MainPage : Page
 
     private void UpdateViewOptionChecks()
     {
+        ListViewModeItem.IsChecked = mailViewMode == MailViewMode.List;
+        BoardViewModeItem.IsChecked = mailViewMode == MailViewMode.Board;
+        var showListAction = mailViewMode == MailViewMode.Board;
+        MailViewModeButton.Label = showListAction ? "List" : "Board";
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(
+            MailViewModeButton,
+            showListAction ? "Switch to List view" : "Switch to Board view");
+        ToolTipService.SetToolTip(MailViewModeButton, showListAction ? "Return to conversation list" : "Open Kanban-style Board view");
         ReadingPaneRightItem.IsChecked = readingPaneMode == ReadingPaneMode.Right;
         ReadingPaneBottomItem.IsChecked = readingPaneMode == ReadingPaneMode.Bottom;
         ReadingPaneOffItem.IsChecked = readingPaneMode == ReadingPaneMode.Off;
@@ -1918,6 +2585,15 @@ public sealed partial class MainPage : Page
 
     private void ApplyReadingLayout()
     {
+        if (mailViewMode == MailViewMode.Board)
+        {
+            BoardWorkspace.Visibility = Visibility.Visible;
+            ThreadListPane.Visibility = Visibility.Collapsed;
+            MessageResizeThumb.Visibility = Visibility.Collapsed;
+            ReadingPane.Visibility = Visibility.Collapsed;
+            return;
+        }
+
         ResetWorkspacePlacement();
         if (isCompact)
         {
@@ -2122,7 +2798,7 @@ public sealed partial class MainPage : Page
     {
         FolderTree.SelectedNode = ViewModel.SelectedFolder is null
             ? null
-            : FindFolderNode(FolderTree.RootNodes, ViewModel.SelectedFolder.Id);
+            : FindFolderNode(FolderTree.RootNodes, ViewModel.SelectedFolder.Id, activeAccountId);
     }
 
     private void SyncFolderTree()
@@ -2149,14 +2825,65 @@ public sealed partial class MainPage : Page
 
     private IReadOnlyList<FolderTreeItem> BuildFolderTreeItems()
     {
-        var roots = ViewModel.Folders
+        if (connectedAccounts.Count > 0)
+        {
+            return connectedAccounts
+                .OrderBy(account => account.SortOrder)
+                .Select(account =>
+                {
+                    var mailbox = new FolderTreeItem(
+                        account.DisplayName,
+                        account.MailboxKey,
+                        accountId: account.AccountId,
+                        isMailboxRoot: true,
+                        countText: account.AccountId == activeAccountId
+                            ? ViewModel.Folders.FirstOrDefault(folder => folder.Id == "INBOX")?.CountText
+                            : null);
+                    if (account.AccountId == activeAccountId)
+                    {
+                        accountFolderSnapshots[account.AccountId] = ViewModel.Folders.ToArray();
+                    }
+
+                    if (accountFolderSnapshots.TryGetValue(account.AccountId, out var folders))
+                    {
+                        mailbox.Children.AddRange(BuildAccountFolderTreeItems(account.AccountId, folders));
+                    }
+                    else
+                    {
+                        mailbox.Children.Add(new FolderTreeItem(
+                            "Open mailbox to load folders",
+                            $"placeholder:{account.AccountId:D}",
+                            accountId: account.AccountId,
+                            treeKey: $"placeholder:{account.AccountId:D}",
+                            isPlaceholder: true));
+                    }
+
+                    return mailbox;
+                })
+                .ToArray();
+        }
+
+        return BuildAccountFolderTreeItems(activeAccountId, ViewModel.Folders);
+    }
+
+    private static IReadOnlyList<FolderTreeItem> BuildAccountFolderTreeItems(
+        Guid? accountId,
+        IEnumerable<MailFolder> accountFolders)
+    {
+        var folders = accountFolders.ToArray();
+        var roots = folders
             .Where(folder => folder.IsSystem)
-            .Select(folder => new FolderTreeItem(folder.Name, folder.FullName, folder))
+            .Select(folder => new FolderTreeItem(
+                folder.Name,
+                folder.FullName,
+                folder,
+                accountId,
+                treeKey: $"folder:{accountId:D}:{folder.FullName}"))
             .ToList();
         var userRoots = new List<FolderTreeItem>();
         var byPath = new Dictionary<string, FolderTreeItem>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var folder in ViewModel.Folders
+        foreach (var folder in folders
                      .Where(folder => !folder.IsSystem)
                      .OrderBy(folder => folder.FullName, StringComparer.CurrentCultureIgnoreCase))
         {
@@ -2170,7 +2897,11 @@ public sealed partial class MainPage : Page
                 var path = string.Join('/', parts.Take(index + 1));
                 if (!byPath.TryGetValue(path, out var current))
                 {
-                    current = new FolderTreeItem(parts[index], path);
+                    current = new FolderTreeItem(
+                        parts[index],
+                        path,
+                        accountId: accountId,
+                        treeKey: $"folder:{accountId:D}:{path}");
                     byPath.Add(path, current);
                     if (parent is null)
                     {
@@ -2206,7 +2937,7 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private static TreeViewNode BuildFolderNode(
+    private TreeViewNode BuildFolderNode(
         FolderTreeItem item,
         ISet<string> expandedPaths,
         bool isInitialTree,
@@ -2218,8 +2949,13 @@ public sealed partial class MainPage : Page
             node.Children.Add(BuildFolderNode(child, expandedPaths, isInitialTree, depth + 1));
         }
 
-        node.IsExpanded = expandedPaths.Contains(item.FullName)
-            || (isInitialTree && depth == 0 && node.HasChildren);
+        var expandNewActiveMailbox = item.IsMailboxRoot
+            && item.AccountId == activeAccountId
+            && item.AccountId is Guid mailboxId
+            && initializedMailboxTrees.Add(mailboxId);
+        node.IsExpanded = expandNewActiveMailbox
+            || expandedPaths.Contains(item.TreeKey)
+            || (isInitialTree && depth == 0 && node.HasChildren && !item.IsMailboxRoot);
         return node;
     }
 
@@ -2231,23 +2967,28 @@ public sealed partial class MainPage : Page
         {
             if (node.IsExpanded && node.Content is FolderTreeItem item)
             {
-                expandedPaths.Add(item.FullName);
+                expandedPaths.Add(item.TreeKey);
             }
 
             CaptureExpandedPaths(node.Children, expandedPaths);
         }
     }
 
-    private static TreeViewNode? FindFolderNode(IEnumerable<TreeViewNode> nodes, string folderId)
+    private static TreeViewNode? FindFolderNode(
+        IEnumerable<TreeViewNode> nodes,
+        string folderId,
+        Guid? accountId)
     {
         foreach (var node in nodes)
         {
-            if (node.Content is FolderTreeItem { Folder: { } folder } && folder.Id == folderId)
+            if (node.Content is FolderTreeItem { Folder: { } folder } item
+                && folder.Id == folderId
+                && item.AccountId == accountId)
             {
                 return node;
             }
 
-            var child = FindFolderNode(node.Children, folderId);
+            var child = FindFolderNode(node.Children, folderId, accountId);
             if (child is not null)
             {
                 return child;
@@ -2339,6 +3080,9 @@ public sealed partial class MainPage : Page
             threadSort = Enum.TryParse<ThreadSort>(settings.ThreadSort, true, out var sort)
                 ? sort
                 : ThreadSort.Newest;
+            mailViewMode = Enum.TryParse<MailViewMode>(settings.MailViewMode, true, out var viewMode)
+                ? viewMode
+                : MailViewMode.List;
             showMessageListToolbar = settings.ShowMessageListToolbar;
             showMessagePreview = settings.ShowMessagePreview;
             showSenderAvatars = settings.ShowSenderAvatars;
@@ -2370,6 +3114,7 @@ public sealed partial class MainPage : Page
                 MessageDensity = messageDensity.ToString(),
                 ThreadGrouping = threadGrouping.ToString(),
                 ThreadSort = threadSort.ToString(),
+                MailViewMode = mailViewMode.ToString(),
                 ShowMessageListToolbar = showMessageListToolbar,
                 ShowMessagePreview = showMessagePreview,
                 ShowSenderAvatars = showSenderAvatars,
@@ -2461,7 +3206,7 @@ public sealed partial class MainPage : Page
 
     private void UpdateSyncProgressIndicator()
     {
-        var visibility = ViewModel.IsSyncingAll
+        var visibility = ViewModel.IsSyncingAll || allAccountsSyncCancellation is not null
             ? Visibility.Visible
             : Visibility.Collapsed;
         SyncAllProgressBar.Visibility = visibility;
@@ -2470,7 +3215,7 @@ public sealed partial class MainPage : Page
 
     private async void AutoSyncTimer_Tick(DispatcherQueueTimer sender, object args)
     {
-        if (autoSyncInProgress || ViewModel.IsBusy || !ViewModel.IsConnected)
+        if (autoSyncInProgress || ViewModel.IsBusy)
         {
             return;
         }
@@ -2478,10 +3223,7 @@ public sealed partial class MainPage : Page
         autoSyncInProgress = true;
         try
         {
-            await ViewModel.RefreshAsync();
-            SyncFolderTree();
-            UpdateContentPanels();
-            await PollForNewMailAsync();
+            await SyncEnabledAccountsAsync(showProgress: false);
         }
         finally
         {
@@ -2489,41 +3231,144 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private async Task PollForNewMailAsync()
+    private async Task SyncEnabledAccountsAsync(bool showProgress)
     {
-        if (notificationPollInProgress || ViewModel.IsBusy || !ViewModel.IsConnected)
+        if (allAccountsSyncCancellation is not null)
         {
             return;
         }
 
-        notificationPollInProgress = true;
+        allAccountsSyncCancellation = new CancellationTokenSource();
+        UpdateSyncProgressIndicator();
+        var cancellationToken = allAccountsSyncCancellation.Token;
         try
         {
-            var unread = await ViewModel.GetUnreadInboxSampleAsync();
-            var currentIds = unread.Select(thread => thread.Id).ToHashSet(StringComparer.Ordinal);
-            if (notificationBaselineEstablished && Application.Current is App app)
+            await RefreshConnectedAccountsAsync();
+            var accounts = connectedAccounts
+                .Where(account => !showProgress ? account.AutomaticSyncEnabled : true)
+                .OrderBy(account => account.SortOrder)
+                .ToArray();
+            if (accounts.Length == 0 && ViewModel.IsConnected)
             {
-                foreach (var thread in unread
-                             .Where(thread => !knownUnreadInboxThreads.Contains(thread.Id))
-                             .OrderBy(thread => thread.ReceivedAt)
-                             .TakeLast(3))
-                {
-                    app.NotificationService?.ShowNewMail(thread);
-                }
+                await ViewModel.RefreshAsync(cancellationToken);
+                await PublishHistoryNotificationsAsync(ViewModel, activeAccountId);
+                return;
             }
 
-            knownUnreadInboxThreads.Clear();
-            knownUnreadInboxThreads.UnionWith(currentIds);
-            notificationBaselineEstablished = true;
+            var completed = 0;
+            var failures = new List<string>();
+            foreach (var account in accounts)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (showProgress)
+                {
+                    ViewModel.SyncStatusText = "Syncing all mailboxes";
+                    ViewModel.SyncStatusDetail = $"Checking {account.DisplayName} ({completed + 1} of {accounts.Length}).";
+                    ViewModel.SyncProgressValue = accounts.Length == 0
+                        ? 0
+                        : completed * 100d / accounts.Length;
+                }
+
+                try
+                {
+                    MainViewModel syncViewModel;
+                    if (account.AccountId == activeAccountId)
+                    {
+                        syncViewModel = ViewModel;
+                        await syncViewModel.RefreshAsync(cancellationToken);
+                    }
+                    else
+                    {
+                        var session = await accountCoordinator.GetSessionAsync(account.AccountId, cancellationToken);
+                        syncViewModel = new MainViewModel(
+                            session.Gmail,
+                            session.MailStore,
+                            session.SignatureSettings,
+                            session.LifetimeToken,
+                            session.OperationGate);
+                        await syncViewModel.InitializeAsync(cancellationToken);
+                    }
+
+                    if (!syncViewModel.IsConnected || !syncViewModel.LastRefreshSucceeded)
+                    {
+                        throw new InvalidOperationException(syncViewModel.SyncStatusDetail);
+                    }
+
+                    accountFolderSnapshots[account.AccountId] = syncViewModel.Folders.ToArray();
+                    await PublishHistoryNotificationsAsync(syncViewModel, account.AccountId);
+                    await accountCoordinator.UpdateAccountSyncStatusAsync(
+                        account.AccountId,
+                        GmailAccountSyncState.Ready,
+                        DateTimeOffset.UtcNow,
+                        lastSyncError: null,
+                        cancellationToken);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    failures.Add($"{account.DisplayName}: {ex.GetBaseException().Message}");
+                    await accountCoordinator.UpdateAccountSyncStatusAsync(
+                        account.AccountId,
+                        GmailAccountSyncState.Error,
+                        account.LastSuccessfulSyncAt,
+                        ex.GetBaseException().Message,
+                        CancellationToken.None);
+                }
+
+                completed++;
+            }
+
+            ViewModel.SyncProgressValue = 100;
+            ViewModel.SyncStatusText = failures.Count == 0
+                ? "All mailboxes are current"
+                : "Mailbox sync completed with errors";
+            ViewModel.SyncStatusDetail = failures.Count == 0
+                ? $"Checked {completed} mailbox{(completed == 1 ? string.Empty : "es")} using Gmail history."
+                : string.Join("  ", failures);
+            SyncFolderTree();
+            UpdateContentPanels();
+            await RefreshBoardCardsAsync();
         }
-        catch
+        catch (OperationCanceledException)
         {
-            // The regular sync status remains the user-facing source for network errors.
+            ViewModel.SyncStatusText = "Sync canceled";
+            ViewModel.SyncStatusDetail = "Completed Gmail requests were kept; remaining mailboxes were not checked.";
         }
         finally
         {
-            notificationPollInProgress = false;
+            allAccountsSyncCancellation.Dispose();
+            allAccountsSyncCancellation = null;
+            UpdateSyncProgressIndicator();
+            StartAutoSyncTimer();
         }
+    }
+
+    private Task PublishHistoryNotificationsAsync(MainViewModel source, Guid? accountId)
+    {
+        if (Application.Current is not App app || app.NotificationService is null)
+        {
+            return Task.CompletedTask;
+        }
+
+        var account = accountId is Guid id
+            ? connectedAccounts.FirstOrDefault(candidate => candidate.AccountId == id)
+            : null;
+        if (account is { NotificationsEnabled: false })
+        {
+            return Task.CompletedTask;
+        }
+
+        foreach (var thread in source.LastSyncNotificationCandidates
+                     .OrderBy(candidate => candidate.ReceivedAt)
+                     .TakeLast(3))
+        {
+            app.NotificationService.ShowNewMail(thread, account?.EmailAddress);
+        }
+
+        return Task.CompletedTask;
     }
 
     private async Task ShowMessageAsync(string title, string message)
@@ -2543,6 +3388,12 @@ public sealed partial class MainPage : Page
         Right,
         Bottom,
         Off
+    }
+
+    private enum MailViewMode
+    {
+        List,
+        Board
     }
 
     private enum MessageDensity
@@ -2574,6 +3425,7 @@ public sealed partial class MainPage : Page
         public string MessageDensity { get; set; } = nameof(MainPage.MessageDensity.Comfortable);
         public string ThreadGrouping { get; set; } = nameof(MainPage.ThreadGrouping.Date);
         public string ThreadSort { get; set; } = nameof(MainPage.ThreadSort.Newest);
+        public string MailViewMode { get; set; } = nameof(MainPage.MailViewMode.List);
         public bool ShowMessageListToolbar { get; set; } = true;
         public bool ShowMessagePreview { get; set; } = true;
         public bool ShowSenderAvatars { get; set; } = true;

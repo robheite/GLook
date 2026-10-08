@@ -37,11 +37,24 @@ public sealed record MailFolder(
 
 public sealed class FolderTreeItem
 {
-    public FolderTreeItem(string name, string fullName, MailFolder? folder = null)
+    public FolderTreeItem(
+        string name,
+        string fullName,
+        MailFolder? folder = null,
+        Guid? accountId = null,
+        bool isMailboxRoot = false,
+        string? countText = null,
+        string? treeKey = null,
+        bool isPlaceholder = false)
     {
         Name = name;
         FullName = fullName;
         Folder = folder;
+        AccountId = accountId;
+        IsMailboxRoot = isMailboxRoot;
+        CountOverride = countText;
+        TreeKey = treeKey ?? fullName;
+        IsPlaceholder = isPlaceholder;
     }
 
     public string Name { get; }
@@ -50,13 +63,23 @@ public sealed class FolderTreeItem
 
     public MailFolder? Folder { get; set; }
 
+    public Guid? AccountId { get; }
+
+    public bool IsMailboxRoot { get; }
+
+    public string? CountOverride { get; }
+
+    public string TreeKey { get; }
+
+    public bool IsPlaceholder { get; }
+
     public List<FolderTreeItem> Children { get; } = [];
 
-    public string Glyph => Folder?.Glyph ?? "\uE8B7";
+    public string Glyph => IsMailboxRoot ? "\uE77B" : Folder?.Glyph ?? "\uE8B7";
 
-    public string CountText => Folder?.CountText ?? string.Empty;
+    public string CountText => CountOverride ?? Folder?.CountText ?? string.Empty;
 
-    public bool IsSelectable => Folder is not null;
+    public bool IsSelectable => !IsPlaceholder && (Folder is not null || IsMailboxRoot);
 }
 
 public sealed record MailThreadSummary(
@@ -185,6 +208,32 @@ public sealed record MailThreadDetail(
     IReadOnlyList<MailMessage> Messages);
 
 public sealed record GmailAccountProfile(string EmailAddress, ulong HistoryId);
+
+public enum GmailQuotaState
+{
+    Normal,
+    Throttled,
+    WaitingForGmail,
+    RebuildRequired
+}
+
+public sealed record GmailQuotaSnapshot(
+    GmailQuotaState State,
+    int RollingMinuteUnits,
+    int EstimatedDailyUnits,
+    int BackgroundMinuteBudget,
+    DateTimeOffset RecordedAt);
+
+public sealed record GmailHistorySyncResult(
+    ulong StartHistoryId,
+    ulong LatestHistoryId,
+    IReadOnlyList<MailThreadSummary> UpsertedThreads,
+    IReadOnlyList<string> RemovedThreadIds,
+    IReadOnlyList<MailThreadSummary> NotificationCandidates,
+    bool RequiresBootstrap = false)
+{
+    public int ChangedThreadCount => UpsertedThreads.Count + RemovedThreadIds.Count;
+}
 
 public sealed record EmptyTrashResult(
     int DeletedCount,

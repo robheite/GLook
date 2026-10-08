@@ -18,6 +18,8 @@ public sealed class LocalMailStore
         connectionString = new SqliteConnectionStringBuilder { DataSource = databasePath }.ToString();
     }
 
+    public bool HasAccountScope => accountScope is not null;
+
     public void SetAccountScope(string? accountEmail)
     {
         accountScope = string.IsNullOrWhiteSpace(accountEmail)
@@ -37,6 +39,10 @@ public sealed class LocalMailStore
                 thread_hash TEXT NOT NULL,
                 payload BLOB NOT NULL,
                 PRIMARY KEY (account_hash, thread_hash)
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS secure_mail_sync_state (
+                account_hash TEXT NOT NULL PRIMARY KEY,
+                payload BLOB NOT NULL
             ) WITHOUT ROWID;
             DROP TABLE IF EXISTS account_mail_threads;
             DROP TABLE IF EXISTS mail_threads;
@@ -66,6 +72,84 @@ public sealed class LocalMailStore
         {
             await UpsertThreadAsync(connection, transaction, accountHash, thread);
         }
+
+        await transaction.CommitAsync();
+    }
+
+    public async Task<ulong?> GetHistoryCursorAsync()
+    {
+        if (accountScope is null)
+        {
+            return null;
+        }
+
+        var accountHash = HashAccountId(accountScope);
+        await using var connection = await OpenConnectionAsync();
+        var command = connection.CreateCommand();
+        command.CommandText = "SELECT payload FROM secure_mail_sync_state WHERE account_hash = $accountHash;";
+        command.Parameters.AddWithValue("$accountHash", accountHash);
+        var payload = await command.ExecuteScalarAsync() as byte[];
+        return payload is null ? null : UnprotectSyncState(payload)?.HistoryId;
+    }
+
+    /// <summary>
+    /// Applies a Gmail history result and advances its cursor in one SQLite
+    /// transaction. A failed apply therefore replays the same history range on
+    /// the next run instead of skipping mailbox changes.
+    /// </summary>
+    public async Task ApplyHistorySyncAsync(
+        GmailHistorySyncResult result,
+        bool replaceAccountSnapshot = false)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        if (result.RequiresBootstrap)
+        {
+            throw new ArgumentException("A rebuild marker cannot be persisted as a completed history sync.", nameof(result));
+        }
+
+        var accountHash = CurrentAccountHash();
+        var upserts = MaterializeThreads(result.UpsertedThreads);
+        var removals = result.RemovedThreadIds
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        await using var connection = await OpenConnectionAsync();
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
+        if (replaceAccountSnapshot)
+        {
+            var clear = connection.CreateCommand();
+            clear.Transaction = transaction;
+            clear.CommandText = "DELETE FROM secure_mail_threads WHERE account_hash = $accountHash;";
+            clear.Parameters.AddWithValue("$accountHash", accountHash);
+            await clear.ExecuteNonQueryAsync();
+        }
+
+        foreach (var threadId in removals)
+        {
+            await DeleteThreadHashAsync(
+                connection,
+                transaction,
+                accountHash,
+                HashThreadId(accountHash, threadId));
+        }
+
+        foreach (var thread in upserts)
+        {
+            await UpsertThreadAsync(connection, transaction, accountHash, thread);
+        }
+
+        var syncState = new CachedSyncState(result.LatestHistoryId, DateTimeOffset.UtcNow);
+        var stateCommand = connection.CreateCommand();
+        stateCommand.Transaction = transaction;
+        stateCommand.CommandText = """
+            INSERT INTO secure_mail_sync_state (account_hash, payload)
+            VALUES ($accountHash, $payload)
+            ON CONFLICT(account_hash) DO UPDATE SET payload = excluded.payload;
+            """;
+        stateCommand.Parameters.AddWithValue("$accountHash", accountHash);
+        stateCommand.Parameters.Add("$payload", SqliteType.Blob).Value = ProtectSyncState(syncState);
+        await stateCommand.ExecuteNonQueryAsync();
 
         await transaction.CommitAsync();
     }
@@ -144,6 +228,20 @@ public sealed class LocalMailStore
             .ToList();
     }
 
+    public async Task<MailThreadSummary?> LoadThreadAsync(string threadId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(threadId);
+        if (accountScope is null)
+        {
+            return null;
+        }
+
+        var accountHash = HashAccountId(accountScope);
+        await using var connection = await OpenConnectionAsync();
+        var rows = await ReadAccountRowsAsync(connection, transaction: null, accountHash);
+        return rows.Select(row => row.Thread).FirstOrDefault(thread => thread.Id == threadId);
+    }
+
     public async Task RemoveThreadAsync(string threadId)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(threadId);
@@ -165,7 +263,10 @@ public sealed class LocalMailStore
 
         await using var connection = await OpenConnectionAsync();
         var command = connection.CreateCommand();
-        command.CommandText = "DELETE FROM secure_mail_threads WHERE account_hash = $accountHash;";
+        command.CommandText = """
+            DELETE FROM secure_mail_threads WHERE account_hash = $accountHash;
+            DELETE FROM secure_mail_sync_state WHERE account_hash = $accountHash;
+            """;
         command.Parameters.AddWithValue("$accountHash", HashAccountId(accountScope));
         await command.ExecuteNonQueryAsync();
         await ExecuteNonQueryAsync(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
@@ -361,6 +462,47 @@ public sealed class LocalMailStore
         }
     }
 
+    private static byte[] ProtectSyncState(CachedSyncState state)
+    {
+        var plaintext = JsonSerializer.SerializeToUtf8Bytes(state);
+        try
+        {
+            return ProtectedData.Protect(plaintext, CacheEntropy, DataProtectionScope.CurrentUser);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(plaintext);
+        }
+    }
+
+    private static CachedSyncState? UnprotectSyncState(byte[] protectedPayload)
+    {
+        byte[]? plaintext = null;
+        try
+        {
+            plaintext = ProtectedData.Unprotect(
+                protectedPayload,
+                CacheEntropy,
+                DataProtectionScope.CurrentUser);
+            return JsonSerializer.Deserialize<CachedSyncState>(plaintext);
+        }
+        catch (CryptographicException)
+        {
+            return null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+        finally
+        {
+            if (plaintext is not null)
+            {
+                CryptographicOperations.ZeroMemory(plaintext);
+            }
+        }
+    }
+
     private string CurrentAccountHash() => HashAccountId(RequireAccountScope());
 
     private static string HashAccountId(string accountId) =>
@@ -393,4 +535,6 @@ public sealed class LocalMailStore
         bool IsUnread,
         bool IsStarred,
         string[] LabelIds);
+
+    private sealed record CachedSyncState(ulong HistoryId, DateTimeOffset UpdatedAt);
 }

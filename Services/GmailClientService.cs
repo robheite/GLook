@@ -6,6 +6,8 @@ using System.Text.RegularExpressions;
 using Google;
 using GLook.Models;
 using Google.Apis.Auth.OAuth2;
+using Google.Apis.Auth.OAuth2.Flows;
+using Google.Apis.Auth.OAuth2.Responses;
 using Google.Apis.Gmail.v1;
 using Google.Apis.Gmail.v1.Data;
 using Google.Apis.Services;
@@ -17,6 +19,7 @@ namespace GLook.Services;
 public sealed class GmailClientService
 {
     private const int PermanentDeleteBatchSize = 50;
+    private const int MaxIncrementalChangedThreads = 100;
     private static readonly TimeSpan PermanentDeleteBatchDelay = TimeSpan.FromSeconds(12);
     private const string UserId = "me";
     private const string CredentialKey = "primary-account";
@@ -30,7 +33,9 @@ public sealed class GmailClientService
     private static readonly string[] SettingsScopes = [GmailService.Scope.GmailSettingsBasic];
     private static readonly string[] PermanentDeleteScopes = [GmailService.Scope.MailGoogleCom];
     private readonly EncryptedDataStore secureStore;
+    private readonly GmailQuotaGovernor quotaGovernor = new();
     private readonly SemaphoreSlim labelCountRefreshGate = new(1, 1);
+    private GoogleAuthorizationCodeFlow? primaryAuthorizationFlow;
     private Dictionary<string, LabelUnreadCounts> labelUnreadCounts = new(StringComparer.Ordinal);
     private DateTimeOffset labelUnreadCountsExpiresAt = DateTimeOffset.MinValue;
     private GmailService? gmail;
@@ -41,17 +46,72 @@ public sealed class GmailClientService
     public GmailClientService(EncryptedDataStore secureStore)
     {
         this.secureStore = secureStore;
+        quotaGovernor.SnapshotChanged += snapshot => QuotaSnapshotChanged?.Invoke(snapshot);
     }
 
     public bool IsConnected => gmail is not null;
+
+    public GmailQuotaSnapshot QuotaSnapshot => quotaGovernor.Snapshot;
+
+    public event Action<GmailQuotaSnapshot>? QuotaSnapshotChanged;
 
     public async Task<GmailAccountProfile?> TryReconnectAsync(CancellationToken cancellationToken = default)
     {
         var clientJson = LoadPackagedClientSecrets()
             ?? await secureStore.GetAsync<string>(ClientSecretsKey);
-        return string.IsNullOrWhiteSpace(clientJson)
-            ? null
-            : await ConnectAsync(clientJson, false, cancellationToken);
+        if (string.IsNullOrWhiteSpace(clientJson))
+        {
+            return null;
+        }
+
+        // Startup must remain silent. GoogleWebAuthorizationBroker is intended
+        // for interactive authorization and opens the browser when the stored
+        // token is absent or unusable. Rehydrate the credential directly so
+        // only an explicit Connect/Reauthorize action can start OAuth.
+        var token = await secureStore.GetAsync<TokenResponse?>(CredentialKey);
+        if (token is null
+            || (string.IsNullOrWhiteSpace(token.AccessToken)
+                && string.IsNullOrWhiteSpace(token.RefreshToken)))
+        {
+            return null;
+        }
+
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes(clientJson));
+        var secrets = GoogleClientSecrets.FromStream(stream).Secrets;
+        if (string.IsNullOrWhiteSpace(secrets.ClientId) || string.IsNullOrWhiteSpace(secrets.ClientSecret))
+        {
+            return null;
+        }
+
+        var flow = new GoogleAuthorizationCodeFlow(new GoogleAuthorizationCodeFlow.Initializer
+        {
+            ClientSecrets = secrets,
+            Scopes = Scopes,
+            DataStore = secureStore
+        });
+        try
+        {
+            var credential = new UserCredential(flow, CredentialKey, token);
+            var profile = await ActivatePrimaryCredentialAsync(credential, cancellationToken);
+            primaryAuthorizationFlow?.Dispose();
+            primaryAuthorizationFlow = flow;
+            return profile;
+        }
+        catch (TokenResponseException)
+        {
+            flow.Dispose();
+            return null;
+        }
+        catch (GoogleApiException ex) when (ex.HttpStatusCode == HttpStatusCode.Unauthorized)
+        {
+            flow.Dispose();
+            return null;
+        }
+        catch
+        {
+            flow.Dispose();
+            throw;
+        }
     }
 
     public Task<GmailAccountProfile> ConnectAsync(CancellationToken cancellationToken = default)
@@ -80,27 +140,55 @@ public sealed class GmailClientService
             cancellationToken,
             secureStore);
 
-        gmail?.Dispose();
-        gmail = new GmailService(new BaseClientService.Initializer
-        {
-            HttpClientInitializer = credential,
-            ApplicationName = "GLook"
-        });
+        primaryAuthorizationFlow?.Dispose();
+        primaryAuthorizationFlow = null;
 
         if (rememberClient)
         {
             await secureStore.StoreAsync(ClientSecretsKey, clientSecretsJson);
         }
 
-        var profile = await gmail.Users.GetProfile(UserId).ExecuteAsync(cancellationToken);
-        connectedEmailAddress = profile.EmailAddress;
-        return new GmailAccountProfile(profile.EmailAddress, profile.HistoryId ?? 0);
+        return await ActivatePrimaryCredentialAsync(credential, cancellationToken);
+    }
+
+    private async Task<GmailAccountProfile> ActivatePrimaryCredentialAsync(
+        UserCredential credential,
+        CancellationToken cancellationToken)
+    {
+        var candidate = new GmailService(new BaseClientService.Initializer
+        {
+            HttpClientInitializer = credential,
+            ApplicationName = "GLook"
+        });
+        try
+        {
+            var profile = await quotaGovernor.ExecuteAsync(
+                GmailApiMethod.GetProfile,
+                GmailRequestPriority.Interactive,
+                () => candidate.Users.GetProfile(UserId).ExecuteAsync(cancellationToken),
+                status: null,
+                cancellationToken);
+            gmail?.Dispose();
+            gmail = candidate;
+            connectedEmailAddress = profile.EmailAddress;
+            return new GmailAccountProfile(profile.EmailAddress, profile.HistoryId ?? 0);
+        }
+        catch
+        {
+            candidate.Dispose();
+            throw;
+        }
     }
 
     public async Task<IReadOnlyList<MailFolder>> GetFoldersAsync(CancellationToken cancellationToken = default)
     {
         var service = RequireClient();
-        var response = await service.Users.Labels.List(UserId).ExecuteAsync(cancellationToken);
+        var response = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.LabelsList,
+            GmailRequestPriority.Background,
+            () => service.Users.Labels.List(UserId).ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         var labels = response.Labels ?? [];
         await ApplyUnreadCountsAsync(service, labels, cancellationToken);
 
@@ -112,6 +200,182 @@ public sealed class GmailClientService
             .ToList();
 
         return folders;
+    }
+
+    public async Task<GmailHistorySyncResult> GetHistoryChangesAsync(
+        ulong startHistoryId,
+        Action<string>? status = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (startHistoryId == 0)
+        {
+            return new GmailHistorySyncResult(0, 0, [], [], [], RequiresBootstrap: true);
+        }
+
+        var service = RequireClient();
+        var affectedThreadIds = new HashSet<string>(StringComparer.Ordinal);
+        var notificationThreadIds = new HashSet<string>(StringComparer.Ordinal);
+        var latestHistoryId = startHistoryId;
+        string? pageToken = null;
+
+        try
+        {
+            do
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var request = service.Users.History.List(UserId);
+                request.StartHistoryId = startHistoryId;
+                request.MaxResults = 500;
+                request.PageToken = pageToken;
+                var response = await quotaGovernor.ExecuteAsync(
+                    GmailApiMethod.HistoryList,
+                    GmailRequestPriority.Background,
+                    () => request.ExecuteAsync(cancellationToken),
+                    status,
+                    cancellationToken);
+
+                latestHistoryId = Math.Max(latestHistoryId, response.HistoryId ?? startHistoryId);
+                foreach (var history in response.History ?? [])
+                {
+                    latestHistoryId = Math.Max(latestHistoryId, history.Id ?? startHistoryId);
+                    AddAffectedThreads(history.Messages, affectedThreadIds);
+                    AddAffectedThreads(history.MessagesDeleted?.Select(item => item.Message), affectedThreadIds);
+                    AddAffectedThreads(history.LabelsAdded?.Select(item => item.Message), affectedThreadIds);
+                    AddAffectedThreads(history.LabelsRemoved?.Select(item => item.Message), affectedThreadIds);
+
+                    foreach (var added in history.MessagesAdded ?? [])
+                    {
+                        var message = added.Message;
+                        if (!string.IsNullOrWhiteSpace(message?.ThreadId))
+                        {
+                            affectedThreadIds.Add(message.ThreadId);
+                            // History payloads may omit labels. When present, avoid
+                            // treating sent or draft messages as notification input;
+                            // resolve final INBOX/UNREAD state from the thread below.
+                            if (message.LabelIds is null
+                                || message.LabelIds.Count == 0
+                                || message.LabelIds.Contains("INBOX", StringComparer.Ordinal))
+                            {
+                                notificationThreadIds.Add(message.ThreadId);
+                            }
+                        }
+                    }
+                }
+
+                pageToken = response.NextPageToken;
+            }
+            while (!string.IsNullOrWhiteSpace(pageToken));
+        }
+        catch (GoogleApiException ex) when (ex.HttpStatusCode == HttpStatusCode.NotFound)
+        {
+            quotaGovernor.MarkRebuildRequired();
+            status?.Invoke("Gmail history expired; rebuilding the bounded local mirror.");
+            return new GmailHistorySyncResult(
+                startHistoryId,
+                startHistoryId,
+                [],
+                [],
+                [],
+                RequiresBootstrap: true);
+        }
+
+        if (affectedThreadIds.Count > MaxIncrementalChangedThreads)
+        {
+            quotaGovernor.MarkRebuildRequired();
+            status?.Invoke(
+                $"Gmail reported {affectedThreadIds.Count:N0} changed conversations; using the bounded rebuild path instead of an unbounded download.");
+            return new GmailHistorySyncResult(
+                startHistoryId,
+                startHistoryId,
+                [],
+                [],
+                [],
+                RequiresBootstrap: true);
+        }
+
+        var upserts = new List<MailThreadSummary>(affectedThreadIds.Count);
+        var removals = new List<string>();
+        foreach (var threadId in affectedThreadIds)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                upserts.Add(await GetThreadSummaryForSyncAsync(
+                    service,
+                    threadId,
+                    GmailRequestPriority.Background,
+                    status,
+                    cancellationToken));
+            }
+            catch (GoogleApiException ex) when (ex.HttpStatusCode == HttpStatusCode.NotFound)
+            {
+                removals.Add(threadId);
+            }
+        }
+
+        var notifications = upserts
+            .Where(thread => notificationThreadIds.Contains(thread.Id)
+                && thread.IsUnread
+                && thread.LabelIds.Contains("INBOX", StringComparer.Ordinal))
+            .ToList();
+        if (affectedThreadIds.Count > 0)
+        {
+            InvalidateLabelUnreadCounts();
+        }
+
+        return new GmailHistorySyncResult(
+            startHistoryId,
+            latestHistoryId,
+            upserts,
+            removals,
+            notifications);
+    }
+
+    public async Task<GmailHistorySyncResult> GetBoundedBootstrapAsync(
+        int maxResults = 50,
+        Action<string>? status = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (maxResults is < 1 or > 100)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxResults), "Bootstrap depth must be between 1 and 100 threads.");
+        }
+
+        var service = RequireClient();
+        // Capture the cursor before the snapshot. Any mailbox changes which race
+        // the bounded read will be replayed by the next history request.
+        var profile = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.GetProfile,
+            GmailRequestPriority.Background,
+            () => service.Users.GetProfile(UserId).ExecuteAsync(cancellationToken),
+            status,
+            cancellationToken);
+        var cursor = profile.HistoryId ?? 0;
+
+        var list = service.Users.Threads.List(UserId);
+        list.MaxResults = maxResults;
+        list.IncludeSpamTrash = true;
+        var response = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.ThreadsList,
+            GmailRequestPriority.Background,
+            () => list.ExecuteAsync(cancellationToken),
+            status,
+            cancellationToken);
+
+        var threads = new List<MailThreadSummary>(response.Threads?.Count ?? 0);
+        foreach (var item in response.Threads ?? [])
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            threads.Add(await GetThreadSummaryForSyncAsync(
+                service,
+                item.Id,
+                GmailRequestPriority.Background,
+                status,
+                cancellationToken));
+        }
+
+        InvalidateLabelUnreadCounts();
+        return new GmailHistorySyncResult(0, cursor, threads, [], []);
     }
 
     public async Task<IReadOnlyList<MailThreadSummary>> GetThreadsAsync(
@@ -132,7 +396,12 @@ public sealed class GmailClientService
             list.LabelIds = new[] { labelId };
         }
 
-        var response = await list.ExecuteAsync(cancellationToken);
+        var response = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.ThreadsList,
+            GmailRequestPriority.Interactive,
+            () => list.ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         if (response.Threads is null || response.Threads.Count == 0)
         {
             return [];
@@ -147,7 +416,12 @@ public sealed class GmailClientService
                 var request = service.Users.Threads.Get(UserId, item.Id);
                 request.Format = UsersResource.ThreadsResource.GetRequest.FormatEnum.Metadata;
                 request.MetadataHeaders = new[] { "From", "Subject", "Date" };
-                var thread = await request.ExecuteAsync(cancellationToken);
+                var thread = await quotaGovernor.ExecuteAsync(
+                    GmailApiMethod.ThreadsGet,
+                    GmailRequestPriority.Interactive,
+                    () => request.ExecuteAsync(cancellationToken),
+                    status: null,
+                    cancellationToken);
                 return ToSummary(thread);
             }
             finally
@@ -180,7 +454,9 @@ public sealed class GmailClientService
             || list.Q?.Contains("in:trash", StringComparison.OrdinalIgnoreCase) == true;
         list.LabelIds = new[] { labelId };
 
-        var response = await ExecuteWithQuotaRetryAsync(
+        var response = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.ThreadsList,
+            GmailRequestPriority.Background,
             () => list.ExecuteAsync(cancellationToken),
             status,
             cancellationToken);
@@ -202,7 +478,9 @@ public sealed class GmailClientService
             var request = service.Users.Threads.Get(UserId, item.Id);
             request.Format = UsersResource.ThreadsResource.GetRequest.FormatEnum.Metadata;
             request.MetadataHeaders = new[] { "From", "Subject", "Date" };
-            var thread = await ExecuteWithQuotaRetryAsync(
+            var thread = await quotaGovernor.ExecuteAsync(
+                GmailApiMethod.ThreadsGet,
+                GmailRequestPriority.Background,
                 () => request.ExecuteAsync(cancellationToken),
                 status,
                 cancellationToken);
@@ -225,7 +503,12 @@ public sealed class GmailClientService
         var request = service.Users.Threads.Get(UserId, threadId);
         request.Format = UsersResource.ThreadsResource.GetRequest.FormatEnum.Metadata;
         request.MetadataHeaders = new[] { "From", "To", "Cc", "Subject", "Date", "Message-Id", "References" };
-        var thread = await request.ExecuteAsync(cancellationToken);
+        var thread = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.ThreadsGet,
+            GmailRequestPriority.Interactive,
+            () => request.ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         var orderedMessages = (thread.Messages ?? [])
             .OrderBy(message => message.InternalDate ?? 0)
             .ToList();
@@ -236,7 +519,12 @@ public sealed class GmailClientService
         {
             var messageRequest = service.Users.Messages.Get(UserId, summary.Id);
             messageRequest.Format = UsersResource.MessagesResource.GetRequest.FormatEnum.Full;
-            var message = await messageRequest.ExecuteAsync(cancellationToken);
+            var message = await quotaGovernor.ExecuteAsync(
+                GmailApiMethod.MessagesGet,
+                GmailRequestPriority.Interactive,
+                () => messageRequest.ExecuteAsync(cancellationToken),
+                status: null,
+                cancellationToken);
             var body = await ExtractBodyContentAsync(message, cancellationToken);
             var bodyBytes = Encoding.UTF8.GetByteCount(body.Text)
                 + (body.Html is null ? 0 : Encoding.UTF8.GetByteCount(body.Html));
@@ -289,13 +577,33 @@ public sealed class GmailClientService
 
     public async Task TrashThreadAsync(string threadId, CancellationToken cancellationToken = default)
     {
-        await RequireClient().Users.Threads.Trash(UserId, threadId).ExecuteAsync(cancellationToken);
+        var service = RequireClient();
+        await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.ThreadsTrash,
+            GmailRequestPriority.Interactive,
+            async () =>
+            {
+                await service.Users.Threads.Trash(UserId, threadId).ExecuteAsync(cancellationToken);
+                return true;
+            },
+            status: null,
+            cancellationToken);
         InvalidateLabelUnreadCounts();
     }
 
     public async Task RestoreThreadFromTrashAsync(string threadId, CancellationToken cancellationToken = default)
     {
-        await RequireClient().Users.Threads.Untrash(UserId, threadId).ExecuteAsync(cancellationToken);
+        var service = RequireClient();
+        await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.ThreadsUntrash,
+            GmailRequestPriority.Interactive,
+            async () =>
+            {
+                await service.Users.Threads.Untrash(UserId, threadId).ExecuteAsync(cancellationToken);
+                return true;
+            },
+            status: null,
+            cancellationToken);
         InvalidateLabelUnreadCounts();
     }
 
@@ -309,7 +617,13 @@ public sealed class GmailClientService
             AddLabelIds = isRead ? null : ["UNREAD"],
             RemoveLabelIds = isRead ? ["UNREAD"] : null
         };
-        await RequireClient().Users.Threads.Modify(body, UserId, threadId).ExecuteAsync(cancellationToken);
+        var service = RequireClient();
+        await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.ThreadsModify,
+            GmailRequestPriority.Interactive,
+            () => service.Users.Threads.Modify(body, UserId, threadId).ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         InvalidateLabelUnreadCounts();
     }
 
@@ -343,11 +657,17 @@ public sealed class GmailClientService
             return;
         }
 
-        await RequireClient().Users.Threads.Modify(new ModifyThreadRequest
-        {
-            AddLabelIds = additions.Length == 0 ? null : additions,
-            RemoveLabelIds = removals.Length == 0 ? null : removals
-        }, UserId, threadId).ExecuteAsync(cancellationToken);
+        var service = RequireClient();
+        await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.ThreadsModify,
+            GmailRequestPriority.Interactive,
+            () => service.Users.Threads.Modify(new ModifyThreadRequest
+            {
+                AddLabelIds = additions.Length == 0 ? null : additions,
+                RemoveLabelIds = removals.Length == 0 ? null : removals
+            }, UserId, threadId).ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         InvalidateLabelUnreadCounts();
     }
 
@@ -393,7 +713,12 @@ public sealed class GmailClientService
         ArgumentNullException.ThrowIfNull(request);
         var service = RequireClient();
         var message = await CreateApiMessageAsync(request, cancellationToken);
-        var sent = await service.Users.Messages.Send(message, UserId).ExecuteAsync(cancellationToken);
+        var sent = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.MessagesSend,
+            GmailRequestPriority.Interactive,
+            () => service.Users.Messages.Send(message, UserId).ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         InvalidateLabelUnreadCounts();
         return new MailSendResult(
             sent.Id,
@@ -409,14 +734,20 @@ public sealed class GmailClientService
         ArgumentException.ThrowIfNullOrWhiteSpace(draftId);
         ArgumentNullException.ThrowIfNull(request);
         var service = RequireClient();
-        var sent = await service.Users.Drafts.Send(
+        var draftMessage = await CreateApiMessageAsync(request, cancellationToken);
+        var sent = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.DraftsSend,
+            GmailRequestPriority.Interactive,
+            () => service.Users.Drafts.Send(
                 new Draft
                 {
                     Id = draftId,
-                    Message = await CreateApiMessageAsync(request, cancellationToken)
+                    Message = draftMessage
                 },
                 UserId)
-            .ExecuteAsync(cancellationToken);
+            .ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         InvalidateLabelUnreadCounts();
         return new MailSendResult(
             sent.Id,
@@ -437,8 +768,18 @@ public sealed class GmailClientService
         };
 
         var saved = string.IsNullOrWhiteSpace(draftId)
-            ? await service.Users.Drafts.Create(draft, UserId).ExecuteAsync(cancellationToken)
-            : await service.Users.Drafts.Update(draft, UserId, draftId).ExecuteAsync(cancellationToken);
+            ? await quotaGovernor.ExecuteAsync(
+                GmailApiMethod.DraftsCreate,
+                GmailRequestPriority.Interactive,
+                () => service.Users.Drafts.Create(draft, UserId).ExecuteAsync(cancellationToken),
+                status: null,
+                cancellationToken)
+            : await quotaGovernor.ExecuteAsync(
+                GmailApiMethod.DraftsUpdate,
+                GmailRequestPriority.Interactive,
+                () => service.Users.Drafts.Update(draft, UserId, draftId).ExecuteAsync(cancellationToken),
+                status: null,
+                cancellationToken);
         InvalidateLabelUnreadCounts();
         return new MailDraftResult(saved.Id, saved.Message?.Id ?? string.Empty, saved.Message?.ThreadId);
     }
@@ -446,7 +787,17 @@ public sealed class GmailClientService
     public async Task DeleteDraftAsync(string draftId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(draftId);
-        await RequireClient().Users.Drafts.Delete(UserId, draftId).ExecuteAsync(cancellationToken);
+        var service = RequireClient();
+        await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.DraftsDelete,
+            GmailRequestPriority.Interactive,
+            async () =>
+            {
+                await service.Users.Drafts.Delete(UserId, draftId).ExecuteAsync(cancellationToken);
+                return true;
+            },
+            status: null,
+            cancellationToken);
         InvalidateLabelUnreadCounts();
     }
 
@@ -455,7 +806,13 @@ public sealed class GmailClientService
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(draftId);
-        var draft = await RequireClient().Users.Drafts.Get(UserId, draftId).ExecuteAsync(cancellationToken);
+        var service = RequireClient();
+        var draft = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.DraftsGet,
+            GmailRequestPriority.Interactive,
+            () => service.Users.Drafts.Get(UserId, draftId).ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         return new MailDraftResult(draft.Id, draft.Message?.Id ?? string.Empty, draft.Message?.ThreadId);
     }
 
@@ -529,7 +886,12 @@ public sealed class GmailClientService
         }
 
         var service = RequireClient();
-        var existing = (await service.Users.Labels.List(UserId).ExecuteAsync(cancellationToken)).Labels ?? [];
+        var existing = (await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.LabelsList,
+            GmailRequestPriority.Interactive,
+            () => service.Users.Labels.List(UserId).ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken)).Labels ?? [];
         var parts = normalized.Split('/');
         Label? created = null;
 
@@ -544,12 +906,17 @@ public sealed class GmailClientService
                 continue;
             }
 
-            created = await service.Users.Labels.Create(new Label
-            {
-                Name = currentPath,
-                LabelListVisibility = "labelShow",
-                MessageListVisibility = "show"
-            }, UserId).ExecuteAsync(cancellationToken);
+            created = await quotaGovernor.ExecuteAsync(
+                GmailApiMethod.LabelsCreate,
+                GmailRequestPriority.Interactive,
+                () => service.Users.Labels.Create(new Label
+                {
+                    Name = currentPath,
+                    LabelListVisibility = "labelShow",
+                    MessageListVisibility = "show"
+                }, UserId).ExecuteAsync(cancellationToken),
+                status: null,
+                cancellationToken);
             existing.Add(created);
         }
 
@@ -559,7 +926,17 @@ public sealed class GmailClientService
 
     public async Task DeleteFolderAsync(string labelId, CancellationToken cancellationToken = default)
     {
-        await RequireClient().Users.Labels.Delete(UserId, labelId).ExecuteAsync(cancellationToken);
+        var service = RequireClient();
+        await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.LabelsDelete,
+            GmailRequestPriority.Interactive,
+            async () =>
+            {
+                await service.Users.Labels.Delete(UserId, labelId).ExecuteAsync(cancellationToken);
+                return true;
+            },
+            status: null,
+            cancellationToken);
         InvalidateLabelUnreadCounts();
     }
 
@@ -568,8 +945,13 @@ public sealed class GmailClientService
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(labelId);
-        var label = await RequireClient().Users.Labels.Get(UserId, labelId)
-            .ExecuteAsync(cancellationToken);
+        var service = RequireClient();
+        var label = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.LabelsGet,
+            GmailRequestPriority.Interactive,
+            () => service.Users.Labels.Get(UserId, labelId).ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         return (int)(label.ThreadsTotal ?? 0);
     }
 
@@ -578,8 +960,13 @@ public sealed class GmailClientService
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(labelId);
-        var label = await RequireClient().Users.Labels.Get(UserId, labelId)
-            .ExecuteAsync(cancellationToken);
+        var service = RequireClient();
+        var label = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.LabelsGet,
+            GmailRequestPriority.Interactive,
+            () => service.Users.Labels.Get(UserId, labelId).ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         return (int)(label.MessagesTotal ?? 0);
     }
 
@@ -610,7 +997,9 @@ public sealed class GmailClientService
             }
             else
             {
-                await ExecuteWithQuotaRetryAsync(
+                await quotaGovernor.ExecuteAsync(
+                    GmailApiMethod.MessagesBatchDelete,
+                    GmailRequestPriority.Interactive,
                     async () =>
                     {
                         await service.Users.Messages.BatchDelete(
@@ -619,7 +1008,7 @@ public sealed class GmailClientService
                             .ExecuteAsync(cancellationToken);
                         return true;
                     },
-                    null,
+                    status: null,
                     cancellationToken);
                 deleted += confirmedBatch.Length;
                 progress?.Invoke(deleted + skipped, ids.Count);
@@ -655,9 +1044,11 @@ public sealed class GmailClientService
                 {
                     var request = service.Users.Messages.Get(UserId, messageId);
                     request.Format = UsersResource.MessagesResource.GetRequest.FormatEnum.Minimal;
-                    var message = await ExecuteWithQuotaRetryAsync(
+                    var message = await quotaGovernor.ExecuteAsync(
+                        GmailApiMethod.MessagesGet,
+                        GmailRequestPriority.Interactive,
                         () => request.ExecuteAsync(cancellationToken),
-                        null,
+                        status: null,
                         cancellationToken);
                     return message.LabelIds?.Contains("TRASH", StringComparer.Ordinal) == true
                         ? messageId
@@ -693,9 +1084,11 @@ public sealed class GmailClientService
             list.IncludeSpamTrash = true;
             list.MaxResults = 500;
             list.PageToken = pageToken;
-            var page = await ExecuteWithQuotaRetryAsync(
+            var page = await quotaGovernor.ExecuteAsync(
+                GmailApiMethod.MessagesList,
+                GmailRequestPriority.Interactive,
                 () => list.ExecuteAsync(cancellationToken),
-                null,
+                status: null,
                 cancellationToken);
             foreach (var message in page.Messages ?? [])
             {
@@ -728,9 +1121,11 @@ public sealed class GmailClientService
             list.IncludeSpamTrash = true;
             list.MaxResults = 500;
             list.PageToken = pageToken;
-            var page = await ExecuteWithQuotaRetryAsync(
+            var page = await quotaGovernor.ExecuteAsync(
+                GmailApiMethod.ThreadsList,
+                GmailRequestPriority.Interactive,
                 () => list.ExecuteAsync(cancellationToken),
-                null,
+                status: null,
                 cancellationToken);
             foreach (var thread in page.Threads ?? [])
             {
@@ -748,13 +1143,15 @@ public sealed class GmailClientService
         progress?.Invoke(0, ids.Count);
         for (var index = 0; index < ids.Count; index++)
         {
-            await ExecuteWithQuotaRetryAsync(
+            await quotaGovernor.ExecuteAsync(
+                GmailApiMethod.ThreadsTrash,
+                GmailRequestPriority.Interactive,
                 async () =>
                 {
                     await service.Users.Threads.Trash(UserId, ids[index]).ExecuteAsync(cancellationToken);
                     return true;
                 },
-                null,
+                status: null,
                 cancellationToken);
             progress?.Invoke(index + 1, ids.Count);
 
@@ -774,7 +1171,12 @@ public sealed class GmailClientService
         CancellationToken cancellationToken = default)
     {
         var service = await EnsureSettingsClientAsync(cancellationToken);
-        var response = await service.Users.Settings.SendAs.List(UserId).ExecuteAsync(cancellationToken);
+        var response = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.SettingsSendAsList,
+            GmailRequestPriority.Interactive,
+            () => service.Users.Settings.SendAs.List(UserId).ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         return (response.SendAs ?? [])
             .Where(item => string.Equals(item.VerificationStatus, "accepted", StringComparison.OrdinalIgnoreCase)
                 || item.IsPrimary == true)
@@ -803,11 +1205,16 @@ public sealed class GmailClientService
         ArgumentNullException.ThrowIfNull(signature);
         var service = await EnsureSettingsClientAsync(cancellationToken);
         var html = SignatureTextToHtml(signatureText);
-        var updated = await service.Users.Settings.SendAs.Patch(
+        var updated = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.SettingsSendAsUpdate,
+            GmailRequestPriority.Interactive,
+            () => service.Users.Settings.SendAs.Patch(
                 new SendAs { Signature = html },
                 UserId,
                 signature.EmailAddress)
-            .ExecuteAsync(cancellationToken);
+            .ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         return new MailSignature(
             updated.SendAsEmail ?? signature.EmailAddress,
             updated.DisplayName ?? signature.DisplayName,
@@ -841,7 +1248,12 @@ public sealed class GmailClientService
         }
 
         var service = RequireClient();
-        var labels = (await service.Users.Labels.List(UserId).ExecuteAsync(cancellationToken)).Labels ?? [];
+        var labels = (await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.LabelsList,
+            GmailRequestPriority.Interactive,
+            () => service.Users.Labels.List(UserId).ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken)).Labels ?? [];
         var affected = labels
             .Where(label => label.Type == "user"
                 && (string.Equals(label.Name, normalizedCurrent, StringComparison.OrdinalIgnoreCase)
@@ -874,11 +1286,16 @@ public sealed class GmailClientService
         {
             foreach (var item in affected)
             {
-                await service.Users.Labels.Patch(
+                await quotaGovernor.ExecuteAsync(
+                    GmailApiMethod.LabelsUpdate,
+                    GmailRequestPriority.Interactive,
+                    () => service.Users.Labels.Patch(
                         new Label { Name = item.NewName },
                         UserId,
                         item.Label.Id)
-                    .ExecuteAsync(cancellationToken);
+                    .ExecuteAsync(cancellationToken),
+                    status: null,
+                    cancellationToken);
                 renamed.Add((item.Label.Id, item.Label.Name));
             }
 
@@ -890,11 +1307,16 @@ public sealed class GmailClientService
             {
                 try
                 {
-                    await service.Users.Labels.Patch(
+                    await quotaGovernor.ExecuteAsync(
+                        GmailApiMethod.LabelsUpdate,
+                        GmailRequestPriority.Interactive,
+                        () => service.Users.Labels.Patch(
                             new Label { Name = item.OldName },
                             UserId,
                             item.Id)
-                        .ExecuteAsync(CancellationToken.None);
+                        .ExecuteAsync(CancellationToken.None),
+                        status: null,
+                        CancellationToken.None);
                 }
                 catch
                 {
@@ -910,6 +1332,8 @@ public sealed class GmailClientService
     {
         gmail?.Dispose();
         gmail = null;
+        primaryAuthorizationFlow?.Dispose();
+        primaryAuthorizationFlow = null;
         gmailSettings?.Dispose();
         gmailSettings = null;
         gmailPermanentDelete?.Dispose();
@@ -977,7 +1401,12 @@ public sealed class GmailClientService
             HttpClientInitializer = credential,
             ApplicationName = "GLook"
         });
-        var profile = await candidate.Users.GetProfile(UserId).ExecuteAsync(cancellationToken);
+        var profile = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.GetProfile,
+            GmailRequestPriority.Interactive,
+            () => candidate.Users.GetProfile(UserId).ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         if (!string.Equals(profile.EmailAddress, connectedEmailAddress, StringComparison.OrdinalIgnoreCase))
         {
             candidate.Dispose();
@@ -1070,7 +1499,13 @@ public sealed class GmailClientService
             return connectedEmailAddress;
         }
 
-        var profile = await RequireClient().Users.GetProfile(UserId).ExecuteAsync(cancellationToken);
+        var service = RequireClient();
+        var profile = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.GetProfile,
+            GmailRequestPriority.Interactive,
+            () => service.Users.GetProfile(UserId).ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         connectedEmailAddress = profile.EmailAddress;
         return connectedEmailAddress;
     }
@@ -1081,10 +1516,16 @@ public sealed class GmailClientService
         CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(threadId);
-        var request = RequireClient().Users.Threads.Get(UserId, threadId);
+        var service = RequireClient();
+        var request = service.Users.Threads.Get(UserId, threadId);
         request.Format = UsersResource.ThreadsResource.GetRequest.FormatEnum.Metadata;
         request.MetadataHeaders = new[] { "From", "To", "Cc", "Reply-To", "Subject", "Date", "Message-Id", "References" };
-        var thread = await request.ExecuteAsync(cancellationToken);
+        var thread = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.ThreadsGet,
+            GmailRequestPriority.Interactive,
+            () => request.ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         var latest = (thread.Messages ?? [])
             .OrderByDescending(message => message.InternalDate ?? 0)
             .FirstOrDefault()
@@ -1094,9 +1535,14 @@ public sealed class GmailClientService
             return latest;
         }
 
-        var messageRequest = RequireClient().Users.Messages.Get(UserId, latest.Id);
+        var messageRequest = service.Users.Messages.Get(UserId, latest.Id);
         messageRequest.Format = UsersResource.MessagesResource.GetRequest.FormatEnum.Full;
-        return await messageRequest.ExecuteAsync(cancellationToken);
+        return await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.MessagesGet,
+            GmailRequestPriority.Interactive,
+            () => messageRequest.ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
     }
 
     private async Task<IReadOnlyList<MailAttachmentInput>> GetMessageAttachmentsAsync(
@@ -1136,9 +1582,15 @@ public sealed class GmailClientService
             }
             else if (!string.IsNullOrWhiteSpace(part.Body?.AttachmentId))
             {
-                var body = await RequireClient().Users.Messages.Attachments
-                    .Get(UserId, message.Id, part.Body.AttachmentId)
-                    .ExecuteAsync(cancellationToken);
+                var service = RequireClient();
+                var body = await quotaGovernor.ExecuteAsync(
+                    GmailApiMethod.MessageAttachmentsGet,
+                    GmailRequestPriority.Interactive,
+                    () => service.Users.Messages.Attachments
+                        .Get(UserId, message.Id, part.Body.AttachmentId)
+                        .ExecuteAsync(cancellationToken),
+                    status: null,
+                    cancellationToken);
                 EnsureAttachmentFits(part.Filename, body.Size ?? 0, totalBytes);
                 content = string.IsNullOrWhiteSpace(body.Data)
                     ? []
@@ -1323,8 +1775,13 @@ public sealed class GmailClientService
                     await throttle.WaitAsync(cancellationToken);
                     try
                     {
-                        var detail = await service.Users.Labels.Get(UserId, label.Id)
-                            .ExecuteAsync(cancellationToken);
+                        var detail = await quotaGovernor.ExecuteAsync(
+                            GmailApiMethod.LabelsGet,
+                            GmailRequestPriority.Background,
+                            () => service.Users.Labels.Get(UserId, label.Id)
+                                .ExecuteAsync(cancellationToken),
+                            status: null,
+                            cancellationToken);
                         return new LabelUnreadCountResult(
                             label.Id,
                             new LabelUnreadCounts(
@@ -1480,43 +1937,6 @@ public sealed class GmailClientService
         _ => fallback
     };
 
-    private static async Task<T> ExecuteWithQuotaRetryAsync<T>(
-        Func<Task<T>> operation,
-        Action<string>? status,
-        CancellationToken cancellationToken)
-    {
-        var retryDelays = new[]
-        {
-            TimeSpan.FromSeconds(15),
-            TimeSpan.FromSeconds(30),
-            TimeSpan.FromSeconds(60)
-        };
-
-        for (var attempt = 0; ; attempt++)
-        {
-            try
-            {
-                return await operation();
-            }
-            catch (GoogleApiException ex) when (IsQuotaLimit(ex) && attempt < retryDelays.Length)
-            {
-                var delay = retryDelays[attempt]
-                    + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 1001));
-                status?.Invoke(
-                    $"Gmail is temporarily limiting sync requests. Retrying in {delay.TotalSeconds:0} seconds.");
-                await Task.Delay(delay, cancellationToken);
-            }
-        }
-    }
-
-    private static bool IsQuotaLimit(GoogleApiException exception) =>
-        exception.HttpStatusCode == HttpStatusCode.TooManyRequests
-        || (exception.HttpStatusCode == HttpStatusCode.Forbidden
-            && (exception.Error?.Errors?.Any(error =>
-                    string.Equals(error.Reason, "rateLimitExceeded", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(error.Reason, "userRateLimitExceeded", StringComparison.OrdinalIgnoreCase)) == true
-                || exception.Message.Contains("Quota exceeded", StringComparison.OrdinalIgnoreCase)));
-
     private static string SignatureHtmlToText(string? html)
     {
         if (string.IsNullOrWhiteSpace(html))
@@ -1551,6 +1971,43 @@ public sealed class GmailClientService
             labels.Contains("UNREAD", StringComparer.Ordinal),
             labels.Contains("STARRED", StringComparer.Ordinal),
             labels);
+    }
+
+    private async Task<MailThreadSummary> GetThreadSummaryForSyncAsync(
+        GmailService service,
+        string threadId,
+        GmailRequestPriority priority,
+        Action<string>? status,
+        CancellationToken cancellationToken)
+    {
+        var request = service.Users.Threads.Get(UserId, threadId);
+        request.Format = UsersResource.ThreadsResource.GetRequest.FormatEnum.Metadata;
+        request.MetadataHeaders = new[] { "From", "Subject", "Date" };
+        var thread = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.ThreadsGet,
+            priority,
+            () => request.ExecuteAsync(cancellationToken),
+            status,
+            cancellationToken);
+        return ToSummary(thread);
+    }
+
+    private static void AddAffectedThreads(
+        IEnumerable<Message?>? messages,
+        ISet<string> threadIds)
+    {
+        if (messages is null)
+        {
+            return;
+        }
+
+        foreach (var message in messages)
+        {
+            if (!string.IsNullOrWhiteSpace(message?.ThreadId))
+            {
+                threadIds.Add(message.ThreadId);
+            }
+        }
     }
 
     private static string Header(Message message, string name, string fallback) =>
@@ -1628,9 +2085,15 @@ public sealed class GmailClientService
             return string.Empty;
         }
 
-        var body = await RequireClient().Users.Messages.Attachments
-            .Get(UserId, messageId, part.Body.AttachmentId)
-            .ExecuteAsync(cancellationToken);
+        var service = RequireClient();
+        var body = await quotaGovernor.ExecuteAsync(
+            GmailApiMethod.MessageAttachmentsGet,
+            GmailRequestPriority.Interactive,
+            () => service.Users.Messages.Attachments
+                .Get(UserId, messageId, part.Body.AttachmentId)
+                .ExecuteAsync(cancellationToken),
+            status: null,
+            cancellationToken);
         if (body.Size is > MailResourceLimits.MaxDecodedBodyBytes)
         {
             return BodySizeOmissionMarker;

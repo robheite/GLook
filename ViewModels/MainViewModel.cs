@@ -7,12 +7,15 @@ namespace GLook.ViewModels;
 
 public partial class MainViewModel : ObservableObject
 {
-    private const int BulkSyncThreadsPerFolder = 10;
     private readonly GmailClientService gmail;
     private readonly LocalMailStore localStore;
     private readonly SignatureSettingsStore? signatureStore;
+    private readonly CancellationToken lifetimeToken;
+    private readonly SemaphoreSlim? operationGate;
+    private readonly bool hasPreBoundAccountScope;
     private CancellationTokenSource? refreshCancellation;
-    private readonly Dictionary<string, DateTimeOffset> folderSyncTimes = new(StringComparer.Ordinal);
+    private DateTimeOffset folderListRefreshedAt = DateTimeOffset.MinValue;
+    private readonly HashSet<string> hydratedFolderIds = new(StringComparer.Ordinal);
     private string? composeInReplyTo;
     private string? composeReferences;
     private string? composeRfcMessageId;
@@ -20,11 +23,16 @@ public partial class MainViewModel : ObservableObject
     public MainViewModel(
         GmailClientService gmail,
         LocalMailStore localStore,
-        SignatureSettingsStore? signatureStore = null)
+        SignatureSettingsStore? signatureStore = null,
+        CancellationToken lifetimeToken = default,
+        SemaphoreSlim? operationGate = null)
     {
         this.gmail = gmail;
         this.localStore = localStore;
         this.signatureStore = signatureStore;
+        this.lifetimeToken = lifetimeToken;
+        this.operationGate = operationGate;
+        hasPreBoundAccountScope = localStore.HasAccountScope;
     }
 
     public ObservableCollection<MailFolder> Folders { get; } = [];
@@ -36,6 +44,12 @@ public partial class MainViewModel : ObservableObject
     public ObservableCollection<string> ComposeAttachmentPaths { get; } = [];
 
     public ObservableCollection<MailAttachmentInput> ComposeRetainedAttachments { get; } = [];
+
+    public IReadOnlyList<MailThreadSummary> LastSyncNotificationCandidates { get; private set; } = [];
+
+    public bool LastRefreshSucceeded { get; private set; }
+
+    public GmailQuotaSnapshot QuotaSnapshot => gmail.QuotaSnapshot;
 
     [ObservableProperty]
     public partial MailFolder? SelectedFolder { get; set; }
@@ -165,16 +179,42 @@ public partial class MainViewModel : ObservableObject
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
+        using var linkedInitialization = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            lifetimeToken);
+        cancellationToken = linkedInitialization.Token;
         IsBusy = true;
         SyncStatusText = "Checking your Gmail mirror";
         SyncStatusDetail = "Looking for a securely stored account session.";
         try
         {
-            await localStore.InitializeAsync();
-            var profile = await gmail.TryReconnectAsync(cancellationToken);
+            var gateEntered = false;
+            GmailAccountProfile? profile;
+            try
+            {
+                if (operationGate is not null)
+                {
+                    await operationGate.WaitAsync(cancellationToken);
+                    gateEntered = true;
+                }
+
+                await localStore.InitializeAsync();
+                profile = await gmail.TryReconnectAsync(cancellationToken);
+            }
+            finally
+            {
+                if (gateEntered)
+                {
+                    operationGate!.Release();
+                }
+            }
+
             if (profile is null)
             {
-                localStore.SetAccountScope(null);
+                if (!hasPreBoundAccountScope)
+                {
+                    localStore.SetAccountScope(null);
+                }
                 Threads.Clear();
                 SetDisconnectedStatus();
                 return;
@@ -236,37 +276,86 @@ public partial class MainViewModel : ObservableObject
 
         var operationCancellation = BeginRefreshOperation(cancellationToken);
         cancellationToken = operationCancellation.Token;
+        var gateEntered = false;
 
         IsBusy = true;
-        IsSyncingAll = false;
+        LastRefreshSucceeded = false;
         SyncProgressValue = 0;
         SyncStatusText = "Syncing with Gmail";
-        SyncStatusDetail = $"Fetching labels and recent conversations for {SelectedFolder?.Name ?? "Inbox"}.";
+        SyncStatusDetail = $"Checking Gmail history for {SelectedFolder?.Name ?? "Inbox"}.";
         SyncGlyph = "\uE895";
+        LastSyncNotificationCandidates = [];
         try
         {
-            var selectedId = SelectedFolder?.Id ?? "INBOX";
-            var foldersTask = gmail.GetFoldersAsync(cancellationToken);
-            var threadsTask = gmail.GetThreadsAsync(selectedId, SearchQuery, cancellationToken: cancellationToken);
-            await Task.WhenAll(foldersTask, threadsTask);
-
-            ReplaceFolders(await foldersTask, selectedId);
-            var threads = await threadsTask;
-            await localStore.SaveFolderSnapshotAsync(
-                selectedId,
-                threads,
-                // A Gmail list response is capped, so rows outside this window
-                // cannot safely be treated as removed from the label.
-                reconcileMissing: false);
-            if (string.IsNullOrWhiteSpace(SearchQuery))
+            if (operationGate is not null)
             {
-                folderSyncTimes[selectedId] = DateTimeOffset.UtcNow;
+                await operationGate.WaitAsync(cancellationToken);
+                gateEntered = true;
             }
 
-            ReplaceThreads(threads);
+            var selectedId = SelectedFolder?.Id ?? "INBOX";
+            if (Folders.Count == 0
+                || folderListRefreshedAt <= DateTimeOffset.UtcNow.AddMinutes(-30))
+            {
+                var folders = await gmail.GetFoldersAsync(cancellationToken);
+                ReplaceFolders(folders, selectedId);
+                selectedId = SelectedFolder?.Id ?? "INBOX";
+                folderListRefreshedAt = DateTimeOffset.UtcNow;
+            }
+
+            if (!string.IsNullOrWhiteSpace(SearchQuery))
+            {
+                var searchResults = await gmail.GetThreadsAsync(
+                    selectedId,
+                    SearchQuery,
+                    cancellationToken: cancellationToken);
+                ReplaceThreads(searchResults);
+                LastSyncNotificationCandidates = [];
+                SyncStatusText = "Search results are current";
+                SyncStatusDetail = $"Found {searchResults.Count} recent matching conversations.";
+                SyncGlyph = "\uE73E";
+                LastRefreshSucceeded = true;
+                return;
+            }
+
+            Action<string> quotaStatus = message => SyncStatusDetail = message;
+            var cursor = await localStore.GetHistoryCursorAsync();
+            var sync = cursor is null
+                ? await gmail.GetBoundedBootstrapAsync(status: quotaStatus, cancellationToken: cancellationToken)
+                : await gmail.GetHistoryChangesAsync(cursor.Value, quotaStatus, cancellationToken);
+            var rebuilt = sync.RequiresBootstrap;
+            if (rebuilt)
+            {
+                SyncStatusText = "Rebuilding the local mirror";
+                SyncStatusDetail = "The saved Gmail history cursor expired; loading a bounded recent snapshot.";
+                sync = await gmail.GetBoundedBootstrapAsync(status: quotaStatus, cancellationToken: cancellationToken);
+            }
+
+            await localStore.ApplyHistorySyncAsync(sync, replaceAccountSnapshot: rebuilt || cursor is null);
+            LastSyncNotificationCandidates = sync.NotificationCandidates;
+            await LoadCachedThreadsAsync();
+            if (hydratedFolderIds.Add(selectedId))
+            {
+                SyncStatusDetail = $"Loading a bounded recent page for {SelectedFolder?.FullName ?? "Inbox"}.";
+                var recentFolderThreads = await gmail.GetThreadsAsync(
+                    selectedId,
+                    query: null,
+                    cancellationToken: cancellationToken);
+                await localStore.SaveFolderSnapshotAsync(
+                    selectedId,
+                    recentFolderThreads,
+                    reconcileMissing: false);
+                ReplaceThreads(recentFolderThreads);
+            }
+
+            var quota = gmail.QuotaSnapshot;
             SyncStatusText = "Gmail mirror is current";
-            SyncStatusDetail = $"Synced {threads.Count} recent conversations just now.";
+            SyncStatusDetail = rebuilt || cursor is null
+                ? $"Rebuilt the bounded local mirror with {sync.UpsertedThreads.Count} recent conversations. Quota estimate: {quota.RollingMinuteUnits:N0}/{quota.BackgroundMinuteBudget:N0} units this minute."
+                : $"Applied {sync.ChangedThreadCount} changed conversation{(sync.ChangedThreadCount == 1 ? string.Empty : "s")} from Gmail history. Quota estimate: {quota.RollingMinuteUnits:N0}/{quota.BackgroundMinuteBudget:N0} units this minute.";
             SyncGlyph = "\uE73E";
+            SyncProgressValue = 100;
+            LastRefreshSucceeded = true;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -280,6 +369,11 @@ public partial class MainViewModel : ObservableObject
         }
         finally
         {
+            if (gateEntered)
+            {
+                operationGate!.Release();
+            }
+
             CompleteRefreshOperation(operationCancellation);
         }
     }
@@ -292,113 +386,19 @@ public partial class MainViewModel : ObservableObject
             return false;
         }
 
-        var operationCancellation = BeginRefreshOperation(cancellationToken);
-        cancellationToken = operationCancellation.Token;
-
-        IsBusy = true;
         IsSyncingAll = true;
         SyncProgressValue = 0;
-        SyncStatusText = "Preparing to sync all folders";
-        SyncStatusDetail = "Refreshing the Gmail folder list.";
+        SyncStatusText = "Syncing mailbox history";
+        SyncStatusDetail = "Checking Gmail once for changes across all labels and folders.";
         SyncGlyph = "\uE895";
-        var completedFolderCount = 0;
-        var totalFolderCount = 0;
-
         try
         {
-            var selectedId = SelectedFolder?.Id ?? "INBOX";
-            var folders = await gmail.GetFoldersAsync(cancellationToken);
-            ReplaceFolders(folders, selectedId);
-            selectedId = SelectedFolder?.Id ?? "INBOX";
-
-            var folderList = folders.ToList();
-            totalFolderCount = folderList.Count;
-            var distinctThreadIds = new HashSet<string>(StringComparer.Ordinal);
-            var sharedSummaryCache = new Dictionary<string, MailThreadSummary>(StringComparer.Ordinal);
-            Action<string> quotaStatus = message => SyncStatusDetail = message;
-            if (string.IsNullOrWhiteSpace(SearchQuery)
-                && folderSyncTimes.TryGetValue(selectedId, out var selectedFolderSyncedAt)
-                && selectedFolderSyncedAt >= DateTimeOffset.UtcNow.AddMinutes(-1))
-            {
-                foreach (var thread in Threads)
-                {
-                    sharedSummaryCache[thread.Id] = thread;
-                }
-            }
-
-            for (var index = 0; index < folderList.Count; index++)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var folder = folderList[index];
-                SyncStatusText = $"Syncing all folders ({index + 1} of {folderList.Count})";
-                SyncStatusDetail = $"Fetching recent conversations from {folder.FullName}.";
-
-                var threads = await gmail.GetThreadsForBulkSyncAsync(
-                    folder.Id,
-                    sharedSummaryCache,
-                    quotaStatus,
-                    maxResults: BulkSyncThreadsPerFolder,
-                    cancellationToken: cancellationToken);
-                await localStore.SaveFolderSnapshotAsync(
-                    folder.Id,
-                    threads,
-                    reconcileMissing: false);
-                folderSyncTimes[folder.Id] = DateTimeOffset.UtcNow;
-                distinctThreadIds.UnionWith(threads.Select(thread => thread.Id));
-
-                completedFolderCount = index + 1;
-                SyncProgressValue = completedFolderCount * 100d / folderList.Count;
-            }
-
-            SyncStatusText = "Finishing selected folder";
-            SyncStatusDetail = $"Refreshing {SelectedFolder?.FullName ?? "Inbox"} at normal depth.";
-            var selectedFolderThreads = await gmail.GetThreadsForBulkSyncAsync(
-                selectedId,
-                sharedSummaryCache,
-                quotaStatus,
-                query: SearchQuery,
-                maxResults: 40,
-                cancellationToken: cancellationToken);
-            await localStore.SaveFolderSnapshotAsync(
-                selectedId,
-                selectedFolderThreads,
-                reconcileMissing: false);
-            distinctThreadIds.UnionWith(selectedFolderThreads.Select(thread => thread.Id));
-            folderSyncTimes[selectedId] = DateTimeOffset.UtcNow;
-            ReplaceThreads(selectedFolderThreads);
-
-            SyncStatusText = "Recent mail synced across all folders";
-            SyncStatusDetail = $"Updated {folderList.Count} folders and {distinctThreadIds.Count} recent conversations.";
-            SyncGlyph = "\uE73E";
-            return true;
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            if (ReferenceEquals(refreshCancellation, operationCancellation))
-            {
-                SyncStatusText = "Sync all canceled";
-                SyncStatusDetail = $"Updated {completedFolderCount} of {totalFolderCount} folders before stopping.";
-                SyncGlyph = "\uE711";
-            }
-
-            return false;
-        }
-        catch (Exception ex)
-        {
-            SyncStatusText = "Sync all stopped";
-            SyncStatusDetail = $"Some folders may not be current. {UserFacingError(ex)}";
-            SyncGlyph = "\uE774";
-            await LoadCachedThreadsAsync();
-            return false;
+            await RefreshAsync(cancellationToken);
+            return SyncGlyph == "\uE73E";
         }
         finally
         {
-            if (ReferenceEquals(refreshCancellation, operationCancellation))
-            {
-                IsSyncingAll = false;
-            }
-
-            CompleteRefreshOperation(operationCancellation);
+            IsSyncingAll = false;
         }
     }
 
@@ -924,6 +924,83 @@ public partial class MainViewModel : ObservableObject
                 && removals.Contains(SelectedFolder.Id, StringComparer.Ordinal));
     }
 
+    public async Task ApplyBoardLabelsAsync(
+        MailThreadSummary thread,
+        string targetLabelId,
+        string? sourceLabelId,
+        bool move,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(thread);
+        ArgumentException.ThrowIfNullOrWhiteSpace(targetLabelId);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            timeout.Token,
+            lifetimeToken);
+        var gateEntered = false;
+        IsBusy = true;
+        try
+        {
+            if (operationGate is not null)
+            {
+                await operationGate.WaitAsync(linked.Token);
+                gateEntered = true;
+            }
+
+            var removals = move
+                && !string.IsNullOrWhiteSpace(sourceLabelId)
+                && !string.Equals(sourceLabelId, targetLabelId, StringComparison.Ordinal)
+                ? new[] { sourceLabelId }
+                : null;
+            await gmail.ModifyThreadLabelsAsync(
+                thread.Id,
+                [targetLabelId],
+                removals,
+                linked.Token);
+
+            var current = Threads.FirstOrDefault(candidate => candidate.Id == thread.Id);
+            var sourceSummary = current ?? thread;
+            var updated = sourceSummary with
+            {
+                LabelIds = sourceSummary.LabelIds
+                    .Append(targetLabelId)
+                    .Where(labelId => removals is null || !removals.Contains(labelId, StringComparer.Ordinal))
+                    .Distinct(StringComparer.Ordinal)
+                    .ToArray()
+            };
+            await localStore.SaveThreadsAsync([updated]);
+            if (current is not null)
+            {
+                Threads[Threads.IndexOf(current)] = updated;
+                if (SelectedThread?.Id == updated.Id)
+                {
+                    SelectedThread = updated;
+                }
+            }
+
+            SyncStatusText = move ? "Conversation moved" : "Label added";
+            SyncStatusDetail = "The Board change was accepted by Gmail.";
+            SyncGlyph = "\uE73E";
+        }
+        catch (Exception ex)
+        {
+            SyncStatusText = "Board change did not sync";
+            SyncStatusDetail = UserFacingError(ex);
+            SyncGlyph = "\uEA39";
+            throw;
+        }
+        finally
+        {
+            if (gateEntered)
+            {
+                operationGate!.Release();
+            }
+
+            IsBusy = false;
+        }
+    }
+
     public async Task CreateFolderAsync(string folderPath)
     {
         if (!IsConnected)
@@ -1186,7 +1263,10 @@ public partial class MainViewModel : ObservableObject
     public async Task DisconnectAsync()
     {
         await localStore.ClearCurrentAccountAsync();
-        localStore.SetAccountScope(null);
+        if (!hasPreBoundAccountScope)
+        {
+            localStore.SetAccountScope(null);
+        }
         await gmail.DisconnectAsync();
         Folders.Clear();
         Threads.Clear();
@@ -1625,7 +1705,7 @@ public partial class MainViewModel : ObservableObject
     {
         refreshCancellation?.Cancel();
         refreshCancellation?.Dispose();
-        refreshCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        refreshCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lifetimeToken);
         return refreshCancellation;
     }
 
@@ -1674,7 +1754,12 @@ public partial class MainViewModel : ObservableObject
 
     private void ApplyProfile(GmailAccountProfile profile)
     {
-        localStore.SetAccountScope(profile.EmailAddress);
+        if (!localStore.HasAccountScope)
+        {
+            localStore.SetAccountScope(profile.EmailAddress);
+        }
+        hydratedFolderIds.Clear();
+        folderListRefreshedAt = DateTimeOffset.MinValue;
         IsConnected = true;
         AccountEmail = profile.EmailAddress;
         SyncStatusText = "Connected to Gmail";

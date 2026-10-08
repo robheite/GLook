@@ -5,6 +5,7 @@
  xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
  xmlns:models="using:GLook.Models"
+ xmlns:views="using:GLook.Views"
  xmlns:primitives="using:Microsoft.UI.Xaml.Controls.Primitives"
  mc:Ignorable="d" Background="Transparent" Loaded="Page_Loaded"
  SizeChanged="Page_SizeChanged" Unloaded="Page_Unloaded">
@@ -82,8 +83,9 @@
   <CommandBar Grid.Row="0" Background="{ThemeResource GLookReadingBrush}" BorderBrush="{ThemeResource GLookSeparatorBrush}" BorderThickness="0,0,0,1" DefaultLabelPosition="Right" IsDynamicOverflowEnabled="True">
    <AppBarButton AutomationProperties.Name="New email" Click="NewEmail_Click" Icon="Mail" IsEnabled="{Binding IsConnected}" Label="New email"/><AppBarSeparator/>
    <AppBarButton AutomationProperties.Name="Toggle folders" Click="ToggleFolders_Click" Icon="GlobalNavigationButton" Label="Folders"/>
+   <AppBarButton x:Name="MailViewModeButton" AutomationProperties.HelpText="Switch between the conversation list and Kanban-style Board view" AutomationProperties.Name="Switch to Board view" Click="ToggleMailViewMode_Click" Label="Board" ToolTipService.ToolTip="Open Kanban-style Board view"><AppBarButton.Icon><FontIcon Glyph="&#xE8FD;"/></AppBarButton.Icon></AppBarButton>
    <AppBarButton AutomationProperties.HelpText="Sync the selected Gmail folder" Click="Refresh_Click" Icon="Refresh" IsEnabled="{Binding CanSync}" Label="Sync folder"/>
-   <AppBarButton AutomationProperties.HelpText="Sync the ten newest conversations in every displayed Gmail folder and label" Click="SyncAll_Click" IsEnabled="{Binding CanSync}" Label="Sync all"><AppBarButton.Icon><FontIcon Glyph="&#xE895;"/></AppBarButton.Icon></AppBarButton>
+   <AppBarButton AutomationProperties.HelpText="Check Gmail history for every enabled mailbox" Click="SyncAll_Click" IsEnabled="{Binding CanSync}" Label="Sync all"><AppBarButton.Icon><FontIcon Glyph="&#xE895;"/></AppBarButton.Icon></AppBarButton>
    <AppBarButton Click="NewFolder_Click" Icon="NewFolder" IsEnabled="{Binding IsConnected}" Label="New folder"/>
     <AppBarButton Click="ArchiveThread_Click" IsEnabled="{Binding HasActionSelection}" Label="Archive"><AppBarButton.Icon><FontIcon Glyph="&#xE7B8;"/></AppBarButton.Icon></AppBarButton>
     <AppBarButton AutomationProperties.Name="Move conversation to Trash" Click="DeleteThread_Click" Icon="Delete" IsEnabled="{Binding HasActionSelection}" Label="Delete"/>
@@ -95,6 +97,7 @@
    <CommandBar.SecondaryCommands>
      <AppBarButton Click="DeleteFolder_Click" Label="Delete selected folder"/><AppBarButton Click="JunkThread_Click" IsEnabled="{Binding HasActionSelection}" Label="Mark as spam"/>
     <AppBarButton Label="View options"><AppBarButton.Icon><FontIcon Glyph="&#xE890;"/></AppBarButton.Icon><AppBarButton.Flyout><MenuFlyout>
+     <MenuFlyoutSubItem Text="Layout"><ToggleMenuFlyoutItem x:Name="ListViewModeItem" Click="ListViewMode_Click" Text="List"/><ToggleMenuFlyoutItem x:Name="BoardViewModeItem" Click="BoardViewMode_Click" Text="Board"/></MenuFlyoutSubItem>
      <MenuFlyoutSubItem Text="Reading pane"><ToggleMenuFlyoutItem x:Name="ReadingPaneRightItem" Click="ReadingPaneRight_Click" Text="Right"/><ToggleMenuFlyoutItem x:Name="ReadingPaneBottomItem" Click="ReadingPaneBottom_Click" Text="Bottom"/><ToggleMenuFlyoutItem x:Name="ReadingPaneOffItem" Click="ReadingPaneOff_Click" Text="Off"/></MenuFlyoutSubItem>
      <MenuFlyoutSubItem Text="Message density"><ToggleMenuFlyoutItem x:Name="ComfortableDensityItem" Click="ComfortableDensity_Click" Text="Comfortable"/><ToggleMenuFlyoutItem x:Name="CompactDensityItem" Click="CompactDensity_Click" Text="Compact"/></MenuFlyoutSubItem>
      </MenuFlyout></AppBarButton.Flyout></AppBarButton><AppBarButton AutomationProperties.Name="GLook settings" Click="Settings_Click" Icon="Setting" Label="Settings"/><AppBarButton Click="Signatures_Click" Icon="Edit" IsEnabled="{Binding IsConnected}" Label="Signatures"/><AppBarButton Click="Account_Click" Icon="Contact" Label="Account"/>
@@ -154,6 +157,7 @@
       <Grid x:Name="MessageContentHost" Visibility="Collapsed"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions><Border x:Name="RemoteContentBanner" Padding="16,8" Background="{ThemeResource GLookPaneBrush}" BorderBrush="{ThemeResource GLookSeparatorBrush}" BorderThickness="0,0,0,1" Visibility="Collapsed"><Grid ColumnSpacing="12"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><TextBlock VerticalAlignment="Center" Style="{StaticResource GLookMetadataStyle}" Text="Remote images are blocked to prevent direct tracking requests." TextWrapping="Wrap"/><Button Grid.Column="1" Click="ShowRemoteContent_Click" Content="Show images" Style="{StaticResource SubtleButtonStyle}"/></Grid></Border><WebView2 x:Name="MessageWebView" Grid.Row="1" AutomationProperties.Name="Conversation message content"/><ScrollViewer x:Name="MessageTextFallback" Grid.Row="1" Padding="28,20" Visibility="Collapsed"><TextBlock x:Name="MessageTextFallbackContent" IsTextSelectionEnabled="True" TextWrapping="Wrap"/></ScrollViewer></Grid>
      </Grid>
     </Grid>
+    <views:BoardView x:Name="BoardWorkspace" Grid.RowSpan="3" Grid.ColumnSpan="3" Visibility="Collapsed"/>
    </Grid>
   </SplitView>
   <Grid Grid.Row="2" Padding="12,8" Background="{ThemeResource GLookPaneBrush}" BorderBrush="{ThemeResource GLookSeparatorBrush}" BorderThickness="0,1,0,0">
