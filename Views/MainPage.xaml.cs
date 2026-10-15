@@ -2,6 +2,8 @@ using System.ComponentModel;
 using System.Collections.ObjectModel;
 using System.Collections.Specialized;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.WindowsRuntime;
+using System.Text;
 using System.Text.Json;
 using GLook.Models;
 using GLook.Services;
@@ -19,6 +21,7 @@ namespace GLook.Views;
 
 public sealed partial class MainPage : Page
 {
+    private const string MessageDocumentOrigin = "https://message.glook.invalid/";
     private const int ArrowCursorId = 32512;
     private const int SizeWestEastCursorId = 32644;
     private const int SizeNorthSouthCursorId = 32645;
@@ -37,6 +40,7 @@ public sealed partial class MainPage : Page
     private bool composeDialogOpen;
     private bool autoSyncInProgress;
     private DispatcherQueueTimer? autoSyncTimer;
+    private DispatcherQueueTimer? quotaDisplayTimer;
     private bool autoSyncEnabled = true;
     private int autoSyncIntervalMinutes = DefaultAutoSyncIntervalMinutes;
     private ReadingPaneMode readingPaneMode = ReadingPaneMode.Right;
@@ -48,17 +52,26 @@ public sealed partial class MainPage : Page
     private bool showSenderAvatars = true;
     private MailViewMode mailViewMode = MailViewMode.List;
     private bool isRebuildingThreadView;
+    private bool isThreadViewRebuildQueued;
     private bool isUpdatingThreadSelectionBoxes;
-    private bool messageWebViewInitialized;
+    private string? threadSelectionScopeKey;
+    private Task? messageWebViewInitializationTask;
+    private string? messageDocumentHtml;
+    private string? messageDocumentUri;
+    private ulong? messageNavigationId;
+    private int messageRenderVersion;
     private bool showRemoteMessageContent;
+    private bool alwaysShowRemoteMessageContent;
     private string? renderedThreadId;
     private readonly HashSet<string> collapsedThreadGroups = new(StringComparer.Ordinal);
     private readonly HashSet<string> selectedThreadIds = new(StringComparer.Ordinal);
+    private readonly ObservableCollection<MailThreadSummary> threadItems = [];
     private readonly ObservableCollection<MailThreadGroup> threadGroups = [];
     private readonly CollectionViewSource threadGroupsSource = new() { IsSourceGrouped = true };
     private TreeViewNode? contextFolderNode;
     private bool? folderContextHasPointerTarget;
     private bool? threadContextHasPointerTarget;
+    private MailThreadSummary? threadContextTarget;
     private double messageListWidth = 390;
     private double messageListHeight = 330;
     private readonly string uiSettingsPath = Path.Combine(
@@ -113,6 +126,7 @@ public sealed partial class MainPage : Page
 
     private async void Page_Loaded(object sender, RoutedEventArgs e)
     {
+        StartQuotaDisplayTimer();
         await InitializeAccountsAsync();
         await InitializeBoardAsync();
         UpdateContentPanels();
@@ -125,25 +139,147 @@ public sealed partial class MainPage : Page
     {
         autoSyncTimer?.Stop();
         autoSyncTimer = null;
+        quotaDisplayTimer?.Stop();
+        quotaDisplayTimer = null;
         SaveUiSettings();
+    }
+
+    private void StartQuotaDisplayTimer()
+    {
+        quotaDisplayTimer?.Stop();
+        quotaDisplayTimer = DispatcherQueue.CreateTimer();
+        quotaDisplayTimer.Interval = TimeSpan.FromSeconds(1);
+        quotaDisplayTimer.IsRepeating = true;
+        quotaDisplayTimer.Tick += (_, _) => ViewModel.RefreshQuotaStatus();
+        quotaDisplayTimer.Start();
     }
 
     private void AttachViewModelEvents(MainViewModel viewModel)
     {
         viewModel.Threads.CollectionChanged += ViewModelThreads_CollectionChanged;
         viewModel.PropertyChanged += ViewModel_PropertyChanged;
+        viewModel.StartQuotaTracking();
     }
 
     private void DetachViewModelEvents(MainViewModel viewModel)
     {
         viewModel.Threads.CollectionChanged -= ViewModelThreads_CollectionChanged;
         viewModel.PropertyChanged -= ViewModel_PropertyChanged;
+        viewModel.StopQuotaTracking();
     }
 
     private void ViewModelThreads_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
     {
-        RebuildThreadView();
-        _ = RefreshBoardCardsAsync();
+        var previousSelectionCount = selectedThreadIds.Count;
+        if (e.OldItems is not null)
+        {
+            var replacementIds = e.NewItems?
+                .OfType<MailThreadSummary>()
+                .Select(thread => thread.Id)
+                .ToHashSet(StringComparer.Ordinal)
+                ?? [];
+            selectedThreadIds.ExceptWith(e.OldItems
+                .OfType<MailThreadSummary>()
+                .Where(thread => !replacementIds.Contains(thread.Id))
+                .Select(thread => thread.Id));
+        }
+
+        if (selectedThreadIds.Count != previousSelectionCount)
+        {
+            UpdateThreadSelectionStatus();
+            ApplyRealizedThreadSelectionBoxes();
+        }
+
+        if (TryApplyThreadReplacements(e))
+        {
+            _ = RefreshBoardCardsAsync();
+            return;
+        }
+
+        QueueThreadViewRebuild();
+    }
+
+    private void QueueThreadViewRebuild()
+    {
+        if (isThreadViewRebuildQueued)
+        {
+            return;
+        }
+
+        isThreadViewRebuildQueued = true;
+        if (!DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
+            {
+                isThreadViewRebuildQueued = false;
+                RebuildThreadView(preserveScrollPosition: true);
+                _ = RefreshBoardCardsAsync();
+            }))
+        {
+            isThreadViewRebuildQueued = false;
+            RebuildThreadView(preserveScrollPosition: true);
+            _ = RefreshBoardCardsAsync();
+        }
+    }
+
+    private bool TryApplyThreadReplacements(NotifyCollectionChangedEventArgs e)
+    {
+        if (e.Action != NotifyCollectionChangedAction.Replace
+            || e.OldItems is null
+            || e.NewItems is null
+            || e.OldItems.Count != e.NewItems.Count
+            || e.OldItems.Count == 0)
+        {
+            return false;
+        }
+
+        var replacements = e.OldItems
+            .OfType<MailThreadSummary>()
+            .Zip(e.NewItems.OfType<MailThreadSummary>())
+            .ToList();
+        if (replacements.Count != e.OldItems.Count
+            || replacements.Any(pair => pair.First.Id != pair.Second.Id
+                || pair.First.ReceivedAt != pair.Second.ReceivedAt
+                || !string.Equals(pair.First.Sender, pair.Second.Sender, StringComparison.Ordinal)
+                || !string.Equals(pair.First.Subject, pair.Second.Subject, StringComparison.Ordinal)))
+        {
+            return false;
+        }
+
+        isRebuildingThreadView = true;
+        try
+        {
+            foreach (var (_, replacement) in replacements)
+            {
+                if (threadGrouping == ThreadGrouping.None)
+                {
+                    var current = threadItems.FirstOrDefault(thread => thread.Id == replacement.Id);
+                    var index = current is null ? -1 : threadItems.IndexOf(current);
+                    if (index < 0)
+                    {
+                        return false;
+                    }
+
+                    threadItems[index] = replacement;
+                }
+                else
+                {
+                    var group = threadGroups.FirstOrDefault(candidate =>
+                        candidate.AllThreads.Any(thread => thread.Id == replacement.Id));
+                    if (group is null || !group.ReplaceThread(replacement))
+                    {
+                        return false;
+                    }
+                }
+
+            }
+        }
+        finally
+        {
+            isRebuildingThreadView = false;
+        }
+
+        UpdateThreadSelectionStatus();
+        DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, ApplyRealizedThreadPresentation);
+        return true;
     }
 
     private async Task InitializeAccountsAsync()
@@ -208,6 +344,11 @@ public sealed partial class MainPage : Page
             accountFolderSnapshots[previousAccountId] = ViewModel.Folders.ToArray();
         }
 
+        if (initialize)
+        {
+            _ = await accountCoordinator.RecoverRetainedAccountStateAsync(accountId);
+        }
+
         var session = await accountCoordinator.GetSessionAsync(accountId);
         var replacement = new MainViewModel(
             session.Gmail,
@@ -221,7 +362,8 @@ public sealed partial class MainPage : Page
         DataContext = replacement;
         ComposeDialog.DataContext = replacement;
         AttachViewModelEvents(replacement);
-        selectedThreadIds.Clear();
+        threadSelectionScopeKey = null;
+        ClearThreadSelectionState(clearReadingPane: true);
         collapsedThreadGroups.Clear();
         threadGroups.Clear();
         renderedThreadId = null;
@@ -590,14 +732,23 @@ public sealed partial class MainPage : Page
 
     private void ViewModel_PropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName is nameof(MainViewModel.IsConnected) or nameof(MainViewModel.SelectedThreadDetail))
+        if (e.PropertyName == nameof(MainViewModel.SelectedThread))
+        {
+            ApplyRealizedThreadPresentation();
+        }
+        else if (e.PropertyName is nameof(MainViewModel.IsConnected) or nameof(MainViewModel.SelectedThreadDetail))
         {
             UpdateContentPanels();
             ApplyReadingLayout();
         }
         else if (e.PropertyName == nameof(MainViewModel.SelectedFolder))
         {
+            EnsureThreadSelectionScope();
             SyncFolderSelection();
+        }
+        else if (e.PropertyName == nameof(MainViewModel.SearchQuery))
+        {
+            EnsureThreadSelectionScope();
         }
         else if (e.PropertyName == nameof(MainViewModel.IsSyncingAll))
         {
@@ -905,77 +1056,99 @@ public sealed partial class MainPage : Page
     {
         if (e.ClickedItem is MailThreadSummary thread)
         {
-            isUpdatingThreadSelectionBoxes = true;
-            ThreadList.SelectedItems.Clear();
-            ThreadList.SelectedItems.Add(thread);
-            isUpdatingThreadSelectionBoxes = false;
-            selectedThreadIds.Clear();
-            selectedThreadIds.Add(thread.Id);
-            ApplyRealizedThreadSelectionBoxes();
-            UpdateThreadSelectionStatus();
             await ViewModel.SelectThreadAsync(thread);
         }
-    }
-
-    private void ThreadList_SelectionChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (isRebuildingThreadView || isUpdatingThreadSelectionBoxes)
-        {
-            return;
-        }
-
-        selectedThreadIds.Clear();
-        foreach (var thread in ThreadList.SelectedItems.OfType<MailThreadSummary>())
-        {
-            selectedThreadIds.Add(thread.Id);
-        }
-
-        UpdateThreadSelectionStatus();
-        ApplyRealizedThreadSelectionBoxes();
     }
 
     private void ThreadSelectionCheckBox_Checked(object sender, RoutedEventArgs e)
     {
         if (isUpdatingThreadSelectionBoxes
-            || sender is not CheckBox { CommandParameter: MailThreadSummary thread })
+            || sender is not CheckBox checkBox
+            || checkBox.DataContext is not MailThreadSummary thread)
         {
             return;
         }
 
-        if (!ThreadList.SelectedItems.OfType<MailThreadSummary>().Any(item => item.Id == thread.Id))
+        if (selectedThreadIds.Add(thread.Id))
         {
-            ThreadList.SelectedItems.Add(thread);
+            UpdateThreadSelectionStatus();
         }
     }
 
     private void ThreadSelectionCheckBox_Unchecked(object sender, RoutedEventArgs e)
     {
         if (isUpdatingThreadSelectionBoxes
-            || sender is not CheckBox { CommandParameter: MailThreadSummary thread })
+            || sender is not CheckBox checkBox
+            || checkBox.DataContext is not MailThreadSummary thread)
         {
             return;
         }
 
-        var selected = ThreadList.SelectedItems.OfType<MailThreadSummary>()
-            .FirstOrDefault(item => item.Id == thread.Id);
-        if (selected is not null)
+        if (selectedThreadIds.Remove(thread.Id))
         {
-            ThreadList.SelectedItems.Remove(selected);
+            UpdateThreadSelectionStatus();
         }
     }
 
     private void ThreadSelectionCheckBox_Tapped(object sender, TappedRoutedEventArgs e) =>
         e.Handled = true;
 
-    private void SelectAllThreads_Click(object sender, RoutedEventArgs e) => ThreadList.SelectAll();
+    private void ThreadSelectionCheckBox_Loaded(object sender, RoutedEventArgs e)
+    {
+        if (sender is CheckBox checkBox)
+        {
+            SetThreadSelectionCheckBox(checkBox);
+        }
+    }
+
+    private void ThreadSelectionCheckBox_DataContextChanged(
+        FrameworkElement sender,
+        DataContextChangedEventArgs args)
+    {
+        if (sender is CheckBox checkBox)
+        {
+            SetThreadSelectionCheckBox(checkBox);
+        }
+    }
+
+    private void SelectAllThreads_Click(object sender, RoutedEventArgs e)
+    {
+        selectedThreadIds.Clear();
+        selectedThreadIds.UnionWith(VisibleThreads().Select(thread => thread.Id));
+        UpdateThreadSelectionStatus();
+        ApplyRealizedThreadSelectionBoxes();
+    }
 
     private void ClearThreadSelection_Click(object sender, RoutedEventArgs e)
+        => ClearThreadSelectionState(clearReadingPane: false);
+
+    private void ClearThreadSelectionState(bool clearReadingPane)
     {
-        ThreadList.SelectedItems.Clear();
         selectedThreadIds.Clear();
-        ViewModel.SelectedThread = null;
-        ViewModel.SelectedThreadDetail = null;
+        if (clearReadingPane)
+        {
+            ViewModel.SelectedThread = null;
+            ViewModel.SelectedThreadDetail = null;
+        }
+
         UpdateThreadSelectionStatus();
+        ApplyRealizedThreadSelectionBoxes();
+    }
+
+    private void EnsureThreadSelectionScope()
+    {
+        var scopeKey = $"{activeAccountId:N}|{ViewModel.SelectedFolder?.Id ?? string.Empty}|{ViewModel.SearchQuery.Trim()}";
+        if (string.Equals(threadSelectionScopeKey, scopeKey, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var hadScope = threadSelectionScopeKey is not null;
+        threadSelectionScopeKey = scopeKey;
+        if (hadScope)
+        {
+            ClearThreadSelectionState(clearReadingPane: true);
+        }
     }
 
     private void ThreadGroupHeader_Click(object sender, RoutedEventArgs e)
@@ -1009,22 +1182,12 @@ public sealed partial class MainPage : Page
         if (item?.DataContext is MailThreadSummary thread)
         {
             threadContextHasPointerTarget = true;
-            if (!selectedThreadIds.Contains(thread.Id))
-            {
-                ThreadList.SelectedItems.Clear();
-                ThreadList.SelectedItems.Add(thread);
-            }
-
-            if (ViewModel.SelectedThread?.Id != thread.Id)
-            {
-                ViewModel.SelectedThread = thread;
-                ViewModel.SelectedThreadDetail = null;
-                UpdateContentPanels();
-            }
+            threadContextTarget = thread;
         }
         else
         {
             threadContextHasPointerTarget = false;
+            threadContextTarget = null;
         }
     }
 
@@ -1259,14 +1422,7 @@ public sealed partial class MainPage : Page
             try
             {
                 var session = await accountCoordinator.GetSessionAsync(args.Account.AccountId);
-                await session.Gmail.DisconnectAsync();
-                var profile = await session.Gmail.ConnectAsync();
-                if (!string.Equals(profile.EmailAddress, args.Account.EmailAddress, StringComparison.OrdinalIgnoreCase))
-                {
-                    await session.Gmail.DisconnectAsync();
-                    throw new InvalidOperationException(
-                        $"Google authorized {profile.EmailAddress}, but this mailbox is {args.Account.EmailAddress}.");
-                }
+                _ = await session.Gmail.ReauthorizeAsync(args.Account.EmailAddress);
 
                 await accountCoordinator.UpdateAccountSyncStatusAsync(
                     args.Account.AccountId,
@@ -1342,7 +1498,8 @@ public sealed partial class MainPage : Page
         ComposeDialog.DataContext = replacement;
         AttachViewModelEvents(replacement);
         threadGroups.Clear();
-        selectedThreadIds.Clear();
+        threadSelectionScopeKey = null;
+        ClearThreadSelectionState(clearReadingPane: true);
         UpdateContentPanels();
         SyncFolderTree();
         _ = RefreshBoardCardsAsync();
@@ -1368,6 +1525,17 @@ public sealed partial class MainPage : Page
             IsEnabled = autoSyncEnabled
         };
         autoSyncToggle.Toggled += (_, _) => intervalBox.IsEnabled = autoSyncToggle.IsOn;
+
+        var remotePicturesToggle = new ToggleSwitch
+        {
+            Header = "Always download external pictures",
+            OffContent = "Ask for each message",
+            OnContent = "Download automatically",
+            IsOn = alwaysShowRemoteMessageContent
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(
+            remotePicturesToggle,
+            "Always download external pictures in email");
 
         var notificationStatus = new TextBlock
         {
@@ -1424,6 +1592,20 @@ public sealed partial class MainPage : Page
             FontSize = 12,
             FontWeight = Microsoft.UI.Text.FontWeights.SemiBold
         });
+
+        var privacySection = new StackPanel { Spacing = 8 };
+        privacySection.Children.Add(new TextBlock
+        {
+            Text = "EMAIL PICTURES",
+            FontSize = 12,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold
+        });
+        privacySection.Children.Add(remotePicturesToggle);
+        privacySection.Children.Add(new TextBlock
+        {
+            Text = "External pictures can notify a sender that you opened a message. When this is off, embedded pictures still display and you can use Show images for an individual message.",
+            TextWrapping = TextWrapping.Wrap
+        });
         syncSection.Children.Add(autoSyncToggle);
         syncSection.Children.Add(intervalBox);
         syncSection.Children.Add(new TextBlock
@@ -1433,7 +1615,7 @@ public sealed partial class MainPage : Page
         });
         syncSection.Children.Add(new TextBlock
         {
-            Text = $"Current mailbox quota guard: {ViewModel.QuotaSnapshot.RollingMinuteUnits:N0} of {ViewModel.QuotaSnapshot.BackgroundMinuteBudget:N0} background units this minute ({ViewModel.QuotaSnapshot.State}).",
+            Text = $"Current mailbox Gmail API use: {ViewModel.QuotaSnapshot.RollingMinuteUnits:N0} of {GmailQuotaGovernor.UserUnitsPerMinute:N0} units in the rolling minute; background work pauses at {ViewModel.QuotaSnapshot.BackgroundMinuteBudget:N0} ({ViewModel.QuotaSnapshot.State}).",
             TextWrapping = TextWrapping.Wrap
         });
 
@@ -1454,6 +1636,7 @@ public sealed partial class MainPage : Page
             Spacing = 20
         };
         content.Children.Add(syncSection);
+        content.Children.Add(privacySection);
         content.Children.Add(notificationSection);
 
         var dialog = new ContentDialog
@@ -1479,8 +1662,15 @@ public sealed partial class MainPage : Page
             requestedInterval,
             MinimumAutoSyncIntervalMinutes,
             MaximumAutoSyncIntervalMinutes);
+        var remotePicturePreferenceChanged =
+            alwaysShowRemoteMessageContent != remotePicturesToggle.IsOn;
+        alwaysShowRemoteMessageContent = remotePicturesToggle.IsOn;
         SaveUiSettings();
         StartAutoSyncTimer();
+        if (remotePicturePreferenceChanged && ViewModel.SelectedThreadDetail is { } detail)
+        {
+            _ = RenderSelectedThreadAsync(detail);
+        }
     }
 
     private static string GetNotificationStatusText()
@@ -2006,8 +2196,11 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private void ThreadContextMenu_Closed(object sender, object e) =>
+    private void ThreadContextMenu_Closed(object sender, object e)
+    {
         threadContextHasPointerTarget = null;
+        threadContextTarget = null;
+    }
 
     private void PopulateMoveMenu(IList<MenuFlyoutItemBase> items)
     {
@@ -2333,13 +2526,16 @@ public sealed partial class MainPage : Page
         };
     }
 
-    private void RebuildThreadView()
+    private void RebuildThreadView(bool preserveScrollPosition = false)
     {
         if (isRebuildingThreadView)
         {
             return;
         }
 
+        var previousOffset = preserveScrollPosition
+            ? FindDescendant<ScrollViewer>(ThreadList)?.VerticalOffset
+            : null;
         isRebuildingThreadView = true;
         var sorted = SortThreads(ViewModel.Threads).ToList();
         try
@@ -2347,7 +2543,13 @@ public sealed partial class MainPage : Page
             selectedThreadIds.IntersectWith(sorted.Select(thread => thread.Id));
             if (threadGrouping == ThreadGrouping.None)
             {
-                ThreadList.ItemsSource = sorted;
+                threadItems.Clear();
+                foreach (var thread in sorted)
+                {
+                    threadItems.Add(thread);
+                }
+
+                ThreadList.ItemsSource = threadItems;
             }
             else
             {
@@ -2398,14 +2600,6 @@ public sealed partial class MainPage : Page
                 ThreadList.ItemsSource = threadGroupsSource.View;
             }
 
-            ThreadList.SelectedItems.Clear();
-            var visibleThreads = threadGrouping == ThreadGrouping.None
-                ? sorted
-                : threadGroups.SelectMany(group => group).ToList();
-            foreach (var thread in visibleThreads.Where(thread => selectedThreadIds.Contains(thread.Id)))
-            {
-                ThreadList.SelectedItems.Add(thread);
-            }
         }
         finally
         {
@@ -2413,12 +2607,20 @@ public sealed partial class MainPage : Page
         }
 
         UpdateThreadSelectionStatus();
-        DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, ApplyRealizedThreadPresentation);
+        DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
+        {
+            ThreadList.UpdateLayout();
+            ApplyRealizedThreadPresentation();
+            if (previousOffset is { } offset)
+            {
+                FindDescendant<ScrollViewer>(ThreadList)?.ChangeView(null, offset, null, true);
+            }
+        });
     }
 
     private void UpdateThreadSelectionStatus()
     {
-        var count = ThreadList.SelectedItems.OfType<MailThreadSummary>().Count();
+        var count = selectedThreadIds.Count;
         ViewModel.SelectedThreadCount = count;
         ThreadSelectionStatus.Text = count == 1 ? "1 selected" : $"{count} selected";
         ThreadSelectionStatus.Visibility = count > 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -2426,8 +2628,15 @@ public sealed partial class MainPage : Page
 
     private IReadOnlyList<MailThreadSummary> SelectedThreadsForAction()
     {
-        var selected = ThreadList.SelectedItems
-            .OfType<MailThreadSummary>()
+        if (threadContextHasPointerTarget is true
+            && threadContextTarget is { } contextTarget
+            && !selectedThreadIds.Contains(contextTarget.Id))
+        {
+            return [contextTarget];
+        }
+
+        var selected = ViewModel.Threads
+            .Where(thread => selectedThreadIds.Contains(thread.Id))
             .DistinctBy(thread => thread.Id)
             .ToList();
         if (selected.Count == 0 && ViewModel.SelectedThread is { } current)
@@ -2437,6 +2646,11 @@ public sealed partial class MainPage : Page
 
         return selected;
     }
+
+    private IEnumerable<MailThreadSummary> VisibleThreads() =>
+        threadGrouping == ThreadGrouping.None
+            ? threadItems
+            : threadGroups.SelectMany(group => group);
 
     private IEnumerable<MailThreadSummary> SortThreads(IEnumerable<MailThreadSummary> threads) => threadSort switch
     {
@@ -2499,12 +2713,9 @@ public sealed partial class MainPage : Page
 
     private void ApplyRealizedThreadPresentation()
     {
-        for (var index = 0; index < ThreadList.Items.Count; index++)
+        foreach (var container in FindDescendants<ListViewItem>(ThreadList))
         {
-            if (ThreadList.ContainerFromIndex(index) is ListViewItem container)
-            {
-                ApplyThreadPresentation(container);
-            }
+            ApplyThreadPresentation(container);
         }
     }
 
@@ -2522,12 +2733,9 @@ public sealed partial class MainPage : Page
         isUpdatingThreadSelectionBoxes = true;
         try
         {
-            for (var index = 0; index < ThreadList.Items.Count; index++)
+            foreach (var container in FindDescendants<ListViewItem>(ThreadList))
             {
-                if (ThreadList.ContainerFromIndex(index) is ListViewItem container)
-                {
-                    SetThreadSelectionBox(container);
-                }
+                SetThreadSelectionBox(container);
             }
         }
         finally
@@ -2538,16 +2746,27 @@ public sealed partial class MainPage : Page
 
     private void SetThreadSelectionBox(ListViewItem container)
     {
-        if (container.DataContext is not MailThreadSummary thread
-            || FindDescendant<CheckBox>(container) is not { } checkBox)
+        if (FindDescendant<CheckBox>(container) is not { } checkBox)
         {
             return;
         }
 
+        SetThreadSelectionCheckBox(checkBox);
+    }
+
+    private void SetThreadSelectionCheckBox(CheckBox checkBox)
+    {
         var wasUpdating = isUpdatingThreadSelectionBoxes;
         isUpdatingThreadSelectionBoxes = true;
-        checkBox.IsChecked = selectedThreadIds.Contains(thread.Id);
-        isUpdatingThreadSelectionBoxes = wasUpdating;
+        try
+        {
+            checkBox.IsChecked = checkBox.DataContext is MailThreadSummary thread
+                && selectedThreadIds.Contains(thread.Id);
+        }
+        finally
+        {
+            isUpdatingThreadSelectionBoxes = wasUpdating;
+        }
     }
 
     private void SetTaggedPresentation(DependencyObject parent)
@@ -2561,6 +2780,26 @@ public sealed partial class MainPage : Page
             else if (tag == "ThreadAvatar")
             {
                 element.Visibility = showSenderAvatars ? Visibility.Visible : Visibility.Collapsed;
+            }
+            else if (tag == "ThreadActiveIndicator")
+            {
+                element.Visibility = element.DataContext is MailThreadSummary thread
+                    && string.Equals(ViewModel.SelectedThread?.Id, thread.Id, StringComparison.Ordinal)
+                        ? Visibility.Visible
+                        : Visibility.Collapsed;
+            }
+            else if (tag == "ThreadUnreadIndicator")
+            {
+                element.Visibility = element.DataContext is MailThreadSummary { IsUnread: true }
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+            }
+            else if (tag is "ThreadSender" or "ThreadSubject" or "ThreadReceived"
+                && element is TextBlock textBlock)
+            {
+                textBlock.FontWeight = element.DataContext is MailThreadSummary { IsUnread: true }
+                    ? Microsoft.UI.Text.FontWeights.SemiBold
+                    : Microsoft.UI.Text.FontWeights.Normal;
             }
             else if (tag == "ThreadLayout" && element is Grid grid && grid.ColumnDefinitions.Count > 1)
             {
@@ -2578,7 +2817,6 @@ public sealed partial class MainPage : Page
     {
         ViewModel.SelectedThread = null;
         ViewModel.SelectedThreadDetail = null;
-        ThreadList.SelectedItem = null;
         ApplyReadingLayout();
         UpdateContentPanels();
     }
@@ -2709,46 +2947,109 @@ public sealed partial class MainPage : Page
 
     private async Task RenderSelectedThreadAsync(MailThreadDetail detail)
     {
+        var renderVersion = ++messageRenderVersion;
         try
         {
-            if (!messageWebViewInitialized)
-            {
-                await MessageWebView.EnsureCoreWebView2Async();
-                var settings = MessageWebView.CoreWebView2.Settings;
-                settings.IsScriptEnabled = false;
-                settings.IsWebMessageEnabled = false;
-                settings.AreDefaultScriptDialogsEnabled = false;
-                settings.AreDevToolsEnabled = false;
-                settings.IsStatusBarEnabled = true;
-                MessageWebView.CoreWebView2.NavigationStarting += MessageWebView_NavigationStarting;
-                MessageWebView.CoreWebView2.NewWindowRequested += MessageWebView_NewWindowRequested;
-                messageWebViewInitialized = true;
-            }
+            messageWebViewInitializationTask ??= InitializeMessageWebViewAsync();
+            await messageWebViewInitializationTask;
 
-            if (ViewModel.SelectedThreadDetail?.Id != detail.Id)
+            if (renderVersion != messageRenderVersion
+                || ViewModel.SelectedThreadDetail?.Id != detail.Id)
             {
                 return;
             }
 
+            var allowRemoteContent = alwaysShowRemoteMessageContent || showRemoteMessageContent;
             RemoteContentBanner.Visibility = MailHtmlRenderer.ContainsRemoteContent(detail)
-                && !showRemoteMessageContent
+                && !allowRemoteContent
                     ? Visibility.Visible
                     : Visibility.Collapsed;
             MessageTextFallback.Visibility = Visibility.Collapsed;
             MessageWebView.Visibility = Visibility.Visible;
-            MessageWebView.NavigateToString(MailHtmlRenderer.BuildDocument(detail, showRemoteMessageContent));
+            messageDocumentHtml = MailHtmlRenderer.BuildDocument(detail, allowRemoteContent);
+            messageDocumentUri = $"{MessageDocumentOrigin}conversation/{Uri.EscapeDataString(detail.Id)}?render={renderVersion}";
+            messageNavigationId = null;
+            MessageWebView.CoreWebView2.Navigate(messageDocumentUri);
         }
         catch (Exception ex)
         {
-            MessageWebView.Visibility = Visibility.Collapsed;
-            RemoteContentBanner.Visibility = Visibility.Collapsed;
-            MessageTextFallback.Visibility = Visibility.Visible;
-            MessageTextFallbackContent.Text = string.Join(
-                $"{Environment.NewLine}{Environment.NewLine}────────────────{Environment.NewLine}{Environment.NewLine}",
-                detail.Messages.Select(message =>
-                    $"{message.From}{Environment.NewLine}To: {message.To}{Environment.NewLine}{message.SentText}{Environment.NewLine}{Environment.NewLine}{message.BodyText}"));
-            ReadingSubtitle.Text = $"HTML rendering was unavailable, so GLook is showing safe text. {ex.GetBaseException().Message}";
+            ShowMessageTextFallback(detail, ex.GetBaseException().Message);
         }
+    }
+
+    private async Task InitializeMessageWebViewAsync()
+    {
+        var webViewDataPath = Path.Combine(appDataPath, "WebView2");
+        Directory.CreateDirectory(webViewDataPath);
+        var environment = await CoreWebView2Environment.CreateWithOptionsAsync(
+            browserExecutableFolder: null,
+            userDataFolder: webViewDataPath,
+            options: null);
+        await MessageWebView.EnsureCoreWebView2Async(environment);
+        var settings = MessageWebView.CoreWebView2.Settings;
+        settings.IsScriptEnabled = false;
+        settings.IsWebMessageEnabled = false;
+        settings.AreDefaultScriptDialogsEnabled = false;
+        settings.AreDevToolsEnabled = false;
+        settings.IsStatusBarEnabled = true;
+        MessageWebView.CoreWebView2.AddWebResourceRequestedFilter(
+            $"{MessageDocumentOrigin}*",
+            CoreWebView2WebResourceContext.Document);
+        MessageWebView.CoreWebView2.WebResourceRequested += MessageWebView_WebResourceRequested;
+        MessageWebView.CoreWebView2.NavigationStarting += MessageWebView_NavigationStarting;
+        MessageWebView.CoreWebView2.NavigationCompleted += MessageWebView_NavigationCompleted;
+        MessageWebView.CoreWebView2.NewWindowRequested += MessageWebView_NewWindowRequested;
+    }
+
+    private void MessageWebView_WebResourceRequested(
+        CoreWebView2 sender,
+        CoreWebView2WebResourceRequestedEventArgs args)
+    {
+        if (messageDocumentHtml is not null
+            && string.Equals(args.Request.Uri, messageDocumentUri, StringComparison.Ordinal))
+        {
+            var content = new MemoryStream(Encoding.UTF8.GetBytes(messageDocumentHtml), writable: false)
+                .AsRandomAccessStream();
+            args.Response = sender.Environment.CreateWebResourceResponse(
+                content,
+                200,
+                "OK",
+                "Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store");
+            return;
+        }
+
+        args.Response = sender.Environment.CreateWebResourceResponse(
+            new MemoryStream(Array.Empty<byte>(), writable: false).AsRandomAccessStream(),
+            404,
+            "Not Found",
+            "Cache-Control: no-store");
+    }
+
+    private void MessageWebView_NavigationCompleted(
+        CoreWebView2 sender,
+        CoreWebView2NavigationCompletedEventArgs args)
+    {
+        if (args.NavigationId != messageNavigationId || args.IsSuccess)
+        {
+            return;
+        }
+
+        if (ViewModel.SelectedThreadDetail is { } detail)
+        {
+            ShowMessageTextFallback(detail, $"WebView2 navigation failed ({args.WebErrorStatus}).");
+        }
+    }
+
+    private void ShowMessageTextFallback(MailThreadDetail detail, string reason)
+    {
+        MessageWebView.Visibility = Visibility.Collapsed;
+        RemoteContentBanner.Visibility = Visibility.Collapsed;
+        MessageTextFallback.Visibility = Visibility.Visible;
+        MessageTextFallbackContent.Text = string.Join(
+            $"{Environment.NewLine}{Environment.NewLine}────────────────{Environment.NewLine}{Environment.NewLine}",
+            detail.Messages.Select(message =>
+                $"{message.From}{Environment.NewLine}To: {message.To}{Environment.NewLine}{message.SentText}{Environment.NewLine}{Environment.NewLine}{message.BodyText}"));
+        ReadingSubtitle.Text = $"HTML rendering was unavailable, so GLook is showing safe text. {reason}";
     }
 
     private void ShowRemoteContent_Click(object sender, RoutedEventArgs e)
@@ -2766,8 +3067,9 @@ public sealed partial class MainPage : Page
         CoreWebView2 sender,
         CoreWebView2NavigationStartingEventArgs args)
     {
-        if (args.Uri.StartsWith("about:blank", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(args.Uri, messageDocumentUri, StringComparison.Ordinal))
         {
+            messageNavigationId = args.NavigationId;
             return;
         }
 
@@ -3038,6 +3340,23 @@ public sealed partial class MainPage : Page
         return null;
     }
 
+    private static IEnumerable<T> FindDescendants<T>(DependencyObject parent) where T : DependencyObject
+    {
+        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(parent); index++)
+        {
+            var child = VisualTreeHelper.GetChild(parent, index);
+            if (child is T match)
+            {
+                yield return match;
+            }
+
+            foreach (var descendant in FindDescendants<T>(child))
+            {
+                yield return descendant;
+            }
+        }
+    }
+
     private static T? FindAncestor<T>(DependencyObject? child) where T : DependencyObject
     {
         while (child is not null)
@@ -3086,6 +3405,7 @@ public sealed partial class MainPage : Page
             showMessageListToolbar = settings.ShowMessageListToolbar;
             showMessagePreview = settings.ShowMessagePreview;
             showSenderAvatars = settings.ShowSenderAvatars;
+            alwaysShowRemoteMessageContent = settings.AlwaysShowRemoteMessageContent;
             autoSyncEnabled = settings.AutoSyncEnabled;
             autoSyncIntervalMinutes = Math.Clamp(
                 settings.AutoSyncIntervalMinutes <= 0
@@ -3118,6 +3438,7 @@ public sealed partial class MainPage : Page
                 ShowMessageListToolbar = showMessageListToolbar,
                 ShowMessagePreview = showMessagePreview,
                 ShowSenderAvatars = showSenderAvatars,
+                AlwaysShowRemoteMessageContent = alwaysShowRemoteMessageContent,
                 AutoSyncEnabled = autoSyncEnabled,
                 AutoSyncIntervalMinutes = autoSyncIntervalMinutes,
                 FolderWidth = FolderSplitView.OpenPaneLength,
@@ -3286,7 +3607,9 @@ public sealed partial class MainPage : Page
                             session.SignatureSettings,
                             session.LifetimeToken,
                             session.OperationGate);
-                        await syncViewModel.InitializeAsync(cancellationToken);
+                        await syncViewModel.InitializeAsync(
+                            cancellationToken,
+                            hydrateSelectedFolder: false);
                     }
 
                     if (!syncViewModel.IsConnected || !syncViewModel.LastRefreshSucceeded)
@@ -3429,6 +3752,7 @@ public sealed partial class MainPage : Page
         public bool ShowMessageListToolbar { get; set; } = true;
         public bool ShowMessagePreview { get; set; } = true;
         public bool ShowSenderAvatars { get; set; } = true;
+        public bool AlwaysShowRemoteMessageContent { get; set; }
         public bool AutoSyncEnabled { get; set; } = true;
         public int AutoSyncIntervalMinutes { get; set; } = DefaultAutoSyncIntervalMinutes;
         public double FolderWidth { get; set; } = 252;

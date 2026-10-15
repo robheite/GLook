@@ -132,6 +132,41 @@ public static class AppSelfTestRunner
                 {
                     throw new InvalidOperationException("The encrypted history transaction did not apply removal and cursor advancement together.");
                 }
+
+                testStore.SetAccountScope("legacy@example.invalid");
+                await testStore.SaveThreadsAsync([thread]);
+                await testStore.SaveFoldersAsync([
+                    new MailFolder("INBOX", "Inbox", "INBOX", "\uE715", true, false, 1, 1)
+                ]);
+                await testStore.MarkFolderHydratedAsync("INBOX");
+                const string destinationScope = "11111111-1111-1111-1111-111111111111";
+                if (await testStore.MergeAccountScopeAsync(
+                        "legacy@example.invalid",
+                        destinationScope) != 1)
+                {
+                    throw new InvalidOperationException("The retained account cache was not merged into its stable account scope.");
+                }
+
+                testStore.SetAccountScope(destinationScope);
+                if ((await testStore.LoadThreadsAsync("INBOX", 5)).SingleOrDefault()?.Id != thread.Id)
+                {
+                    throw new InvalidOperationException("The retained account cache could not be loaded after its scope migration.");
+                }
+
+                if ((await testStore.LoadFoldersAsync()).SingleOrDefault()?.Id != "INBOX"
+                    || await testStore.GetFolderSnapshotUpdatedAtAsync() is null
+                    || !(await testStore.LoadHydratedFolderIdsAsync()).Contains("INBOX", StringComparer.Ordinal))
+                {
+                    throw new InvalidOperationException("The retained folder tree, refresh timestamp, and hydration marker could not be loaded after its scope migration.");
+                }
+
+                await testStore.ApplyHistorySyncAsync(
+                    new GmailHistorySyncResult(102, 103, [thread], [], []),
+                    replaceAccountSnapshot: true);
+                if ((await testStore.LoadHydratedFolderIdsAsync()).Count != 0)
+                {
+                    throw new InvalidOperationException("A bounded cache rebuild did not clear stale folder hydration markers.");
+                }
             }
             finally
             {
@@ -142,7 +177,7 @@ public static class AppSelfTestRunner
                 }
             }
 
-            return "Encrypted history applies advance the cursor atomically; official history/thread quota weights and the 4,500-unit background budget are active.";
+            return "Encrypted history applies advance the cursor atomically, retained cache rows merge into stable account scopes, and the 4,500-unit background guard remains below Google's 6,000-unit per-user/project rolling-minute limit.";
         });
 
         await RunCheckAsync(checks, "Multi-account and Board isolation", async () =>
@@ -311,6 +346,20 @@ public static class AppSelfTestRunner
                 throw new InvalidOperationException("HTML formatting or remote-content protection did not behave as expected.");
             }
 
+            var oversizedMarker = "GLook oversized-message marker";
+            var oversizedMessage = message with
+            {
+                BodyHtml = $"<html><body><p>{new string('x', (2 * 1024 * 1024) + 32)}</p><p>{oversizedMarker}</p></body></html>"
+            };
+            var oversizedDocument = MailHtmlRenderer.BuildDocument(
+                new MailThreadDetail("oversized-html-thread", "Oversized HTML check", [oversizedMessage]),
+                allowRemoteContent: false);
+            if (Encoding.UTF8.GetByteCount(oversizedDocument) <= 2 * 1024 * 1024
+                || !oversizedDocument.Contains(oversizedMarker, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("Large HTML email content was truncated before WebView delivery.");
+            }
+
             var localSignature = new MailSignature(string.Empty, "Work", string.Empty, "Regards", false, false)
             {
                 Id = "local:self-test",
@@ -322,7 +371,7 @@ public static class AppSelfTestRunner
             }
 
             return Task.FromResult(
-                "Email tables and formatting are retained, active content is removed, remote images are blocked by default, and local signatures remain distinct from Gmail signatures.");
+                "Email tables and formatting are retained, active content is removed, remote images are blocked by default, large HTML bodies remain intact for streamed WebView delivery, and local signatures remain distinct from Gmail signatures.");
         });
 
         GmailAccountProfile? profile = null;
@@ -769,24 +818,30 @@ public static class AppSelfTestRunner
         string appDataPath,
         CancellationToken cancellationToken)
     {
-        var secureRoot = Path.Combine(appDataPath, "secure");
-        var registry = new AccountRegistry(secureRoot);
-        var account = (await registry.GetAccountsAsync(cancellationToken)).FirstOrDefault();
-        var secureStore = new EncryptedDataStore(account is null
-            ? secureRoot
-            : registry.GetCredentialDirectory(account.AccountId));
-        var localStore = new LocalMailStore(Path.Combine(appDataPath, "mail.db"));
-        var accountScope = account?.AccountId.ToString("D");
-        if (accountScope is not null)
+        var coordinator = new GmailAccountSessionCoordinator(appDataPath);
+        await coordinator.InitializeAsync(cancellationToken);
+        var account = (await coordinator.GetAccountsAsync(cancellationToken)).FirstOrDefault();
+        if (account is not null)
         {
-            localStore.SetAccountScope(accountScope);
+            _ = await coordinator.RecoverRetainedAccountStateAsync(
+                account.AccountId,
+                cancellationToken);
+            var session = await coordinator.GetSessionAsync(account.AccountId, cancellationToken);
+            return new SelfTestContext(
+                session.Gmail,
+                session.MailStore,
+                session.SignatureSettings,
+                account.AccountId.ToString("D"),
+                coordinator);
         }
 
+        var secureStore = new EncryptedDataStore(Path.Combine(appDataPath, "secure"));
         return new SelfTestContext(
             new GmailClientService(secureStore),
-            localStore,
+            new LocalMailStore(Path.Combine(appDataPath, "mail.db")),
             new SignatureSettingsStore(secureStore),
-            accountScope);
+            null,
+            coordinator);
     }
 
     private static async Task RunCheckAsync(
@@ -892,5 +947,6 @@ public static class AppSelfTestRunner
         GmailClientService Gmail,
         LocalMailStore LocalStore,
         SignatureSettingsStore SignatureStore,
-        string? AccountScope);
+        string? AccountScope,
+        GmailAccountSessionCoordinator Coordinator);
 }

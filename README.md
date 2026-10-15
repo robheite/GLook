@@ -2,7 +2,11 @@
 
 GLook is a native Windows mail client that treats Gmail as the source of truth. It is an unpackaged WinUI 3 executable—not a local web server or browser wrapper.
 
-## Current foundation
+## Current release
+
+The current prerelease is **GLook v1.1.0**. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for the complete change list and upgrade notes.
+
+## Application foundation
 
 The first working slice includes:
 

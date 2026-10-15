@@ -448,7 +448,7 @@ public sealed class AccountSettingsItemViewModel : INotifyPropertyChanged
     }
 
     private static string FormatQuotaStatus(GmailQuotaSnapshot quota) =>
-        $"Quota: {quota.State} · {quota.RollingMinuteUnits:N0} of {quota.BackgroundMinuteBudget:N0} background units this minute · {quota.EstimatedDailyUnits:N0} estimated today";
+        $"Gmail API: {quota.RollingMinuteUnits:N0} of {GmailQuotaGovernor.UserUnitsPerMinute:N0} units in the rolling minute · background guard {quota.BackgroundMinuteBudget:N0} · {quota.EstimatedDailyUnits:N0} estimated today · {quota.State}";
 
     private static string FormatLastSync(DateTimeOffset? lastSuccessfulSyncAt) =>
         lastSuccessfulSyncAt is null

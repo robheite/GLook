@@ -87,6 +87,99 @@ public sealed class GmailAccountSessionCoordinator : IAsyncDisposable
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Repairs an interrupted single-account migration without replacing any
+    /// account-scoped files. Matching legacy or orphaned credentials are copied
+    /// only when the registered account has no primary authorization. Cached
+    /// mail is merged into the registered account scope and the source remains
+    /// intact for rollback.
+    /// </summary>
+    public async Task<int> RecoverRetainedAccountStateAsync(
+        Guid accountId,
+        CancellationToken cancellationToken = default)
+    {
+        var session = await GetSessionAsync(accountId, cancellationToken).ConfigureAwait(false);
+        await session.ConnectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await session.MailStore.InitializeAsync().ConfigureAwait(false);
+            var registration = session.Registration;
+            var destinationScope = accountId.ToString("D");
+            var mergedThreadCount = await session.MailStore
+                .MergeAccountScopeAsync(registration.EmailAddress, destinationScope)
+                .ConfigureAwait(false);
+
+            if (await session.Gmail.HasStoredPrimaryAuthorizationAsync().ConfigureAwait(false))
+            {
+                return mergedThreadCount;
+            }
+
+            var registeredAccountIds = (await accountRegistry
+                    .GetAccountsAsync(cancellationToken)
+                    .ConfigureAwait(false))
+                .Select(account => account.AccountId)
+                .ToHashSet();
+            var candidateDirectories = new List<(string Path, string? CacheScope)>
+            {
+                // The legacy email-address cache was already merged above. The
+                // root remains a credential fallback only.
+                (accountRegistry.SecureRootPath, null)
+            };
+            candidateDirectories.AddRange(Directory
+                .EnumerateDirectories(accountRegistry.AccountsRootPath)
+                .Select(path => (Path: path, Name: Path.GetFileName(path)))
+                .Where(candidate => Guid.TryParse(candidate.Name, out var candidateId)
+                    && candidateId != accountId
+                    && !registeredAccountIds.Contains(candidateId))
+                .Select(candidate => (candidate.Path, (string?)candidate.Name)));
+
+            foreach (var candidate in candidateDirectories
+                         .OrderByDescending(item => Directory
+                             .EnumerateFiles(item.Path, "*.bin", SearchOption.TopDirectoryOnly)
+                             .Select(File.GetLastWriteTimeUtc)
+                             .DefaultIfEmpty(DateTime.MinValue)
+                             .Max()))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var candidateStore = new EncryptedDataStore(candidate.Path);
+                using var candidateGmail = new GmailClientService(candidateStore);
+                if (!await candidateGmail.HasStoredPrimaryAuthorizationAsync().ConfigureAwait(false))
+                {
+                    continue;
+                }
+
+                var profile = await candidateGmail.TryReconnectAsync(cancellationToken).ConfigureAwait(false);
+                if (profile is null
+                    || !string.Equals(
+                        profile.EmailAddress,
+                        registration.EmailAddress,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                CopyMissingCredentialFiles(candidate.Path, session.CredentialDirectory);
+                if (!string.IsNullOrWhiteSpace(candidate.CacheScope))
+                {
+                    mergedThreadCount += await session.MailStore
+                        .MergeAccountScopeAsync(candidate.CacheScope, destinationScope)
+                        .ConfigureAwait(false);
+                }
+
+                // Prefer the newest matching retained authorization. Once it is
+                // restored there is no reason to spend another Gmail profile
+                // request examining older credential copies.
+                break;
+            }
+
+            return mergedThreadCount;
+        }
+        finally
+        {
+            session.ConnectionGate.Release();
+        }
+    }
+
     public async Task<GmailAccountSession> GetSessionAsync(
         Guid accountId,
         CancellationToken cancellationToken = default)
@@ -150,7 +243,7 @@ public sealed class GmailAccountSessionCoordinator : IAsyncDisposable
             {
                 // A mismatched credential belongs only to this account
                 // directory; clearing it cannot disconnect another account.
-                await session.Gmail.DisconnectAsync().ConfigureAwait(false);
+                await session.Gmail.ForgetPrimaryAuthorizationAsync().ConfigureAwait(false);
                 throw new InvalidOperationException(
                     $"The saved Gmail authorization belongs to {profile.EmailAddress}, not {session.Registration.EmailAddress}.");
             }
@@ -383,6 +476,22 @@ public sealed class GmailAccountSessionCoordinator : IAsyncDisposable
             CreateBoundMailStore(registration.AccountId));
     }
 
+    private static void CopyMissingCredentialFiles(string sourceDirectory, string destinationDirectory)
+    {
+        Directory.CreateDirectory(destinationDirectory);
+        foreach (var sourcePath in Directory.EnumerateFiles(
+                     sourceDirectory,
+                     "*.bin",
+                     SearchOption.TopDirectoryOnly))
+        {
+            var destinationPath = Path.Combine(destinationDirectory, Path.GetFileName(sourcePath));
+            if (!File.Exists(destinationPath))
+            {
+                File.Copy(sourcePath, destinationPath, overwrite: false);
+            }
+        }
+    }
+
     private LocalMailStore CreateBoundMailStore(Guid accountId)
     {
         var store = new LocalMailStore(databasePath);
@@ -526,6 +635,7 @@ public sealed class GmailAccountSession : IDisposable
 
         isDisposed = true;
         lifetimeCancellation.Cancel();
+        Gmail.Dispose();
         lifetimeCancellation.Dispose();
         ConnectionGate.Dispose();
         OperationGate.Dispose();

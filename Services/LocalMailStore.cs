@@ -9,13 +9,15 @@ namespace GLook.Services;
 public sealed class LocalMailStore
 {
     private static readonly byte[] CacheEntropy = Encoding.UTF8.GetBytes("GLook.MailCache.v2");
+    private readonly string databasePath;
     private readonly string connectionString;
     private string? accountScope;
 
     public LocalMailStore(string databasePath)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(databasePath)!);
-        connectionString = new SqliteConnectionStringBuilder { DataSource = databasePath }.ToString();
+        this.databasePath = Path.GetFullPath(databasePath);
+        Directory.CreateDirectory(Path.GetDirectoryName(this.databasePath)!);
+        connectionString = new SqliteConnectionStringBuilder { DataSource = this.databasePath }.ToString();
     }
 
     public bool HasAccountScope => accountScope is not null;
@@ -29,6 +31,20 @@ public sealed class LocalMailStore
 
     public async Task InitializeAsync()
     {
+        try
+        {
+            await InitializeCurrentDatabaseAsync();
+        }
+        catch (Exception ex) when (ex is InvalidDataException
+            || ex is SqliteException { SqliteErrorCode: 11 })
+        {
+            QuarantineCorruptedDatabase();
+            await InitializeCurrentDatabaseAsync();
+        }
+    }
+
+    private async Task InitializeCurrentDatabaseAsync()
+    {
         await using var connection = await OpenConnectionAsync();
         var legacyTablesFound = await HasLegacyTablesAsync(connection);
 
@@ -41,6 +57,10 @@ public sealed class LocalMailStore
                 PRIMARY KEY (account_hash, thread_hash)
             ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS secure_mail_sync_state (
+                account_hash TEXT NOT NULL PRIMARY KEY,
+                payload BLOB NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS secure_mail_folder_snapshots (
                 account_hash TEXT NOT NULL PRIMARY KEY,
                 payload BLOB NOT NULL
             ) WITHOUT ROWID;
@@ -59,6 +79,188 @@ public sealed class LocalMailStore
             await ExecuteNonQueryAsync(connection, "VACUUM;");
             await ExecuteNonQueryAsync(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
         }
+
+        if (!await IsDatabaseIntegrityValidAsync(connection))
+        {
+            var backupPath = $"{databasePath}.integrity-backup-{DateTime.UtcNow:yyyyMMdd-HHmmssfff}";
+            File.Copy(databasePath, backupPath, overwrite: false);
+            await RebuildSecureTablesAsync(connection);
+            if (!await IsDatabaseIntegrityValidAsync(connection))
+            {
+                throw new InvalidDataException(
+                    $"The encrypted mail cache could not be repaired. The original remains at {backupPath}.");
+            }
+        }
+    }
+
+    private void QuarantineCorruptedDatabase()
+    {
+        SqliteConnection.ClearAllPools();
+        var suffix = $"corrupt-{DateTime.UtcNow:yyyyMMdd-HHmmssfff}";
+        foreach (var path in new[] { databasePath, $"{databasePath}-wal", $"{databasePath}-shm" })
+        {
+            if (File.Exists(path))
+            {
+                File.Move(path, $"{path}.{suffix}", overwrite: false);
+            }
+        }
+    }
+
+    public async Task<int> MergeAccountScopeAsync(string sourceScope, string destinationScope)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(sourceScope);
+        ArgumentException.ThrowIfNullOrWhiteSpace(destinationScope);
+        var normalizedSource = sourceScope.Trim().ToLowerInvariant();
+        var normalizedDestination = destinationScope.Trim().ToLowerInvariant();
+        if (string.Equals(normalizedSource, normalizedDestination, StringComparison.Ordinal))
+        {
+            return 0;
+        }
+
+        var sourceHash = HashAccountId(normalizedSource);
+        var destinationHash = HashAccountId(normalizedDestination);
+        await using var connection = await OpenConnectionAsync();
+        var sourceRows = await ReadAccountRowsAsync(connection, transaction: null, sourceHash);
+        var destinationRows = (await ReadAccountRowsAsync(connection, transaction: null, destinationHash))
+            .Select(row => row.Thread)
+            .ToDictionary(thread => thread.Id, StringComparer.Ordinal);
+
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
+        var mergedCount = 0;
+        foreach (var sourceRow in sourceRows)
+        {
+            if (destinationRows.TryGetValue(sourceRow.Thread.Id, out var existing)
+                && existing.ReceivedAt > sourceRow.Thread.ReceivedAt)
+            {
+                continue;
+            }
+
+            await UpsertThreadAsync(connection, transaction, destinationHash, sourceRow.Thread);
+            destinationRows[sourceRow.Thread.Id] = sourceRow.Thread;
+            mergedCount++;
+        }
+
+        var sourceState = await ReadSyncStateAsync(connection, transaction, sourceHash);
+        var destinationState = await ReadSyncStateAsync(connection, transaction, destinationHash);
+        if (sourceState is not null
+            && (destinationState is null || sourceState.UpdatedAt > destinationState.UpdatedAt))
+        {
+            var stateCommand = connection.CreateCommand();
+            stateCommand.Transaction = transaction;
+            stateCommand.CommandText = """
+                INSERT INTO secure_mail_sync_state (account_hash, payload)
+                VALUES ($accountHash, $payload)
+                ON CONFLICT(account_hash) DO UPDATE SET payload = excluded.payload;
+                """;
+            stateCommand.Parameters.AddWithValue("$accountHash", destinationHash);
+            stateCommand.Parameters.Add("$payload", SqliteType.Blob).Value = ProtectSyncState(sourceState);
+            await stateCommand.ExecuteNonQueryAsync();
+        }
+
+        var sourceFolders = await ReadFolderSnapshotAsync(connection, transaction, sourceHash);
+        var destinationFolders = await ReadFolderSnapshotAsync(connection, transaction, destinationHash);
+        if (sourceFolders is not null)
+        {
+            var preferred = destinationFolders is null || sourceFolders.UpdatedAt > destinationFolders.UpdatedAt
+                ? sourceFolders
+                : destinationFolders;
+            var hydratedFolderIds = (sourceFolders.HydratedFolderIds ?? [])
+                .Concat(destinationFolders?.HydratedFolderIds ?? [])
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            await UpsertFolderSnapshotAsync(
+                connection,
+                transaction,
+                destinationHash,
+                preferred with { HydratedFolderIds = hydratedFolderIds });
+        }
+
+        await transaction.CommitAsync();
+        return mergedCount;
+    }
+
+    public async Task SaveFoldersAsync(IEnumerable<MailFolder> folders)
+    {
+        ArgumentNullException.ThrowIfNull(folders);
+        var accountHash = CurrentAccountHash();
+        await using var connection = await OpenConnectionAsync();
+        var existing = await ReadFolderSnapshotAsync(connection, transaction: null, accountHash);
+        var snapshot = new CachedFolderSnapshot(
+            folders
+                .Where(folder => !string.IsNullOrWhiteSpace(folder.Id))
+                .DistinctBy(folder => folder.Id, StringComparer.Ordinal)
+                .ToArray(),
+            DateTimeOffset.UtcNow,
+            existing?.HydratedFolderIds ?? []);
+        await UpsertFolderSnapshotAsync(connection, transaction: null, accountHash, snapshot);
+    }
+
+    public async Task<IReadOnlyList<MailFolder>> LoadFoldersAsync()
+    {
+        if (accountScope is null)
+        {
+            return [];
+        }
+
+        await using var connection = await OpenConnectionAsync();
+        var snapshot = await ReadFolderSnapshotAsync(
+            connection,
+            transaction: null,
+            HashAccountId(accountScope));
+        return snapshot?.Folders ?? [];
+    }
+
+    public async Task<DateTimeOffset?> GetFolderSnapshotUpdatedAtAsync()
+    {
+        if (accountScope is null)
+        {
+            return null;
+        }
+
+        await using var connection = await OpenConnectionAsync();
+        var snapshot = await ReadFolderSnapshotAsync(
+            connection,
+            transaction: null,
+            HashAccountId(accountScope));
+        return snapshot?.UpdatedAt;
+    }
+
+    public async Task<IReadOnlyList<string>> LoadHydratedFolderIdsAsync()
+    {
+        if (accountScope is null)
+        {
+            return [];
+        }
+
+        await using var connection = await OpenConnectionAsync();
+        var snapshot = await ReadFolderSnapshotAsync(
+            connection,
+            transaction: null,
+            HashAccountId(accountScope));
+        return snapshot?.HydratedFolderIds ?? [];
+    }
+
+    public async Task MarkFolderHydratedAsync(string labelId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(labelId);
+        var accountHash = CurrentAccountHash();
+        await using var connection = await OpenConnectionAsync();
+        var snapshot = await ReadFolderSnapshotAsync(connection, transaction: null, accountHash);
+        if (snapshot is null
+            || (snapshot.HydratedFolderIds?.Contains(labelId, StringComparer.Ordinal) ?? false))
+        {
+            return;
+        }
+
+        var hydratedFolderIds = (snapshot.HydratedFolderIds ?? [])
+            .Append(labelId)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        await UpsertFolderSnapshotAsync(
+            connection,
+            transaction: null,
+            accountHash,
+            snapshot with { HydratedFolderIds = hydratedFolderIds });
     }
 
     public async Task SaveThreadsAsync(IEnumerable<MailThreadSummary> threads)
@@ -123,6 +325,16 @@ public sealed class LocalMailStore
             clear.CommandText = "DELETE FROM secure_mail_threads WHERE account_hash = $accountHash;";
             clear.Parameters.AddWithValue("$accountHash", accountHash);
             await clear.ExecuteNonQueryAsync();
+
+            var folderSnapshot = await ReadFolderSnapshotAsync(connection, transaction, accountHash);
+            if (folderSnapshot is not null)
+            {
+                await UpsertFolderSnapshotAsync(
+                    connection,
+                    transaction,
+                    accountHash,
+                    folderSnapshot with { HydratedFolderIds = [] });
+            }
         }
 
         foreach (var threadId in removals)
@@ -266,6 +478,7 @@ public sealed class LocalMailStore
         command.CommandText = """
             DELETE FROM secure_mail_threads WHERE account_hash = $accountHash;
             DELETE FROM secure_mail_sync_state WHERE account_hash = $accountHash;
+            DELETE FROM secure_mail_folder_snapshots WHERE account_hash = $accountHash;
             """;
         command.Parameters.AddWithValue("$accountHash", HashAccountId(accountScope));
         await command.ExecuteNonQueryAsync();
@@ -301,6 +514,68 @@ public sealed class LocalMailStore
             await connection.DisposeAsync();
             throw;
         }
+    }
+
+    private static async Task<bool> IsDatabaseIntegrityValidAsync(SqliteConnection connection)
+    {
+        var command = connection.CreateCommand();
+        command.CommandText = "PRAGMA integrity_check;";
+        await using var reader = await command.ExecuteReaderAsync();
+        var sawResult = false;
+        while (await reader.ReadAsync())
+        {
+            sawResult = true;
+            if (!string.Equals(reader.GetString(0), "ok", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        return sawResult;
+    }
+
+    private static async Task RebuildSecureTablesAsync(SqliteConnection connection)
+    {
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
+        var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            DROP TABLE IF EXISTS secure_mail_threads_recovered;
+            CREATE TABLE secure_mail_threads_recovered (
+                account_hash TEXT NOT NULL,
+                thread_hash TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                PRIMARY KEY (account_hash, thread_hash)
+            ) WITHOUT ROWID;
+            INSERT OR REPLACE INTO secure_mail_threads_recovered (account_hash, thread_hash, payload)
+            SELECT account_hash, thread_hash, payload FROM secure_mail_threads;
+            DROP TABLE secure_mail_threads;
+            ALTER TABLE secure_mail_threads_recovered RENAME TO secure_mail_threads;
+
+            DROP TABLE IF EXISTS secure_mail_sync_state_recovered;
+            CREATE TABLE secure_mail_sync_state_recovered (
+                account_hash TEXT NOT NULL PRIMARY KEY,
+                payload BLOB NOT NULL
+            ) WITHOUT ROWID;
+            INSERT OR REPLACE INTO secure_mail_sync_state_recovered (account_hash, payload)
+            SELECT account_hash, payload FROM secure_mail_sync_state;
+            DROP TABLE secure_mail_sync_state;
+            ALTER TABLE secure_mail_sync_state_recovered RENAME TO secure_mail_sync_state;
+
+            DROP TABLE IF EXISTS secure_mail_folder_snapshots_recovered;
+            CREATE TABLE secure_mail_folder_snapshots_recovered (
+                account_hash TEXT NOT NULL PRIMARY KEY,
+                payload BLOB NOT NULL
+            ) WITHOUT ROWID;
+            INSERT OR REPLACE INTO secure_mail_folder_snapshots_recovered (account_hash, payload)
+            SELECT account_hash, payload FROM secure_mail_folder_snapshots;
+            DROP TABLE secure_mail_folder_snapshots;
+            ALTER TABLE secure_mail_folder_snapshots_recovered RENAME TO secure_mail_folder_snapshots;
+            """;
+        await command.ExecuteNonQueryAsync();
+        await transaction.CommitAsync();
+        await ExecuteNonQueryAsync(connection, "VACUUM;");
+        await ExecuteNonQueryAsync(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
     }
 
     private static async Task<bool> HasLegacyTablesAsync(SqliteConnection connection)
@@ -356,6 +631,50 @@ public sealed class LocalMailStore
         }
 
         return rows;
+    }
+
+    private static async Task<CachedSyncState?> ReadSyncStateAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string accountHash)
+    {
+        var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT payload FROM secure_mail_sync_state WHERE account_hash = $accountHash;";
+        command.Parameters.AddWithValue("$accountHash", accountHash);
+        var payload = await command.ExecuteScalarAsync() as byte[];
+        return payload is null ? null : UnprotectSyncState(payload);
+    }
+
+    private static async Task<CachedFolderSnapshot?> ReadFolderSnapshotAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string accountHash)
+    {
+        var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT payload FROM secure_mail_folder_snapshots WHERE account_hash = $accountHash;";
+        command.Parameters.AddWithValue("$accountHash", accountHash);
+        var payload = await command.ExecuteScalarAsync() as byte[];
+        return payload is null ? null : UnprotectFolderSnapshot(payload);
+    }
+
+    private static async Task UpsertFolderSnapshotAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string accountHash,
+        CachedFolderSnapshot snapshot)
+    {
+        var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO secure_mail_folder_snapshots (account_hash, payload)
+            VALUES ($accountHash, $payload)
+            ON CONFLICT(account_hash) DO UPDATE SET payload = excluded.payload;
+            """;
+        command.Parameters.AddWithValue("$accountHash", accountHash);
+        command.Parameters.Add("$payload", SqliteType.Blob).Value = ProtectFolderSnapshot(snapshot);
+        await command.ExecuteNonQueryAsync();
     }
 
     private static async Task UpsertThreadAsync(
@@ -503,6 +822,48 @@ public sealed class LocalMailStore
         }
     }
 
+    private static byte[] ProtectFolderSnapshot(CachedFolderSnapshot snapshot)
+    {
+        var plaintext = JsonSerializer.SerializeToUtf8Bytes(snapshot);
+        try
+        {
+            return ProtectedData.Protect(plaintext, CacheEntropy, DataProtectionScope.CurrentUser);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(plaintext);
+        }
+    }
+
+    private static CachedFolderSnapshot? UnprotectFolderSnapshot(byte[] protectedPayload)
+    {
+        byte[]? plaintext = null;
+        try
+        {
+            plaintext = ProtectedData.Unprotect(
+                protectedPayload,
+                CacheEntropy,
+                DataProtectionScope.CurrentUser);
+            var snapshot = JsonSerializer.Deserialize<CachedFolderSnapshot>(plaintext);
+            return snapshot?.Folders is null ? null : snapshot;
+        }
+        catch (CryptographicException)
+        {
+            return null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+        finally
+        {
+            if (plaintext is not null)
+            {
+                CryptographicOperations.ZeroMemory(plaintext);
+            }
+        }
+    }
+
     private string CurrentAccountHash() => HashAccountId(RequireAccountScope());
 
     private static string HashAccountId(string accountId) =>
@@ -537,4 +898,9 @@ public sealed class LocalMailStore
         string[] LabelIds);
 
     private sealed record CachedSyncState(ulong HistoryId, DateTimeOffset UpdatedAt);
+
+    private sealed record CachedFolderSnapshot(
+        MailFolder[] Folders,
+        DateTimeOffset UpdatedAt,
+        string[]? HydratedFolderIds = null);
 }

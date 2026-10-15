@@ -24,6 +24,12 @@
                     <SolidColorBrush x:Key="GLookBrandBrush" Color="#0D5BD7" />
                     <SolidColorBrush x:Key="GLookBrandStrongBrush" Color="#0A3F9A" />
                     <SolidColorBrush x:Key="GLookBrandSoftBrush" Color="#DCEAFF" />
+                    <SolidColorBrush x:Key="GLookActiveThreadBrush" Color="#DCEAFF" />
+                    <SolidColorBrush x:Key="GLookActiveThreadStrokeBrush" Color="#0D5BD7" />
+                    <SolidColorBrush x:Key="GLookUnreadThreadBrush" Color="#EDF4FF" />
+                    <SolidColorBrush x:Key="ListViewItemBackgroundSelected" Color="#CFE2FF" />
+                    <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPointerOver" Color="#BED8FF" />
+                    <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPressed" Color="#A7C9FC" />
                     <SolidColorBrush x:Key="GLookCoralBrush" Color="#E5483F" />
                     <SolidColorBrush x:Key="GLookSyncBrush" Color="#166534" />
                     <SolidColorBrush x:Key="AccentFillColorDefaultBrush" Color="#0D5BD7" />
@@ -42,6 +48,12 @@
                     <SolidColorBrush x:Key="GLookBrandBrush" Color="#48A8FF" />
                     <SolidColorBrush x:Key="GLookBrandStrongBrush" Color="#7EC2FF" />
                     <SolidColorBrush x:Key="GLookBrandSoftBrush" Color="#17365F" />
+                    <SolidColorBrush x:Key="GLookActiveThreadBrush" Color="#17365F" />
+                    <SolidColorBrush x:Key="GLookActiveThreadStrokeBrush" Color="#48A8FF" />
+                    <SolidColorBrush x:Key="GLookUnreadThreadBrush" Color="#12243D" />
+                    <SolidColorBrush x:Key="ListViewItemBackgroundSelected" Color="#183E6E" />
+                    <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPointerOver" Color="#1D4B83" />
+                    <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPressed" Color="#225B9F" />
                     <SolidColorBrush x:Key="GLookCoralBrush" Color="#FF756B" />
                     <SolidColorBrush x:Key="GLookSyncBrush" Color="#72D89A" />
                     <SolidColorBrush x:Key="AccentFillColorDefaultBrush" Color="#1479E8" />
@@ -60,6 +72,12 @@
                     <SolidColorBrush x:Key="GLookBrandBrush" Color="{ThemeResource SystemColorHotlightColor}" />
                     <SolidColorBrush x:Key="GLookBrandStrongBrush" Color="{ThemeResource SystemColorHotlightColor}" />
                     <SolidColorBrush x:Key="GLookBrandSoftBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                    <SolidColorBrush x:Key="GLookActiveThreadBrush" Color="{ThemeResource SystemColorHighlightColor}" />
+                    <SolidColorBrush x:Key="GLookActiveThreadStrokeBrush" Color="{ThemeResource SystemColorHighlightTextColor}" />
+                    <SolidColorBrush x:Key="GLookUnreadThreadBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                    <SolidColorBrush x:Key="ListViewItemBackgroundSelected" Color="{ThemeResource SystemColorHighlightColor}" />
+                    <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPointerOver" Color="{ThemeResource SystemColorHighlightColor}" />
+                    <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPressed" Color="{ThemeResource SystemColorHighlightColor}" />
                     <SolidColorBrush x:Key="GLookCoralBrush" Color="{ThemeResource SystemColorHotlightColor}" />
                     <SolidColorBrush x:Key="GLookSyncBrush" Color="{ThemeResource SystemColorHotlightColor}" />
                 </ResourceDictionary>

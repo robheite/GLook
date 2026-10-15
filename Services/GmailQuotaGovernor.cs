@@ -45,6 +45,7 @@ internal enum GmailRequestPriority
 /// </summary>
 internal sealed class GmailQuotaGovernor
 {
+    internal const int UserUnitsPerMinute = 6_000;
     internal const int BackgroundUnitsPerMinute = 4_500;
     private const int InteractiveUnitsPerMinute = 5_800;
     private const int MaximumAttempts = 4;
@@ -148,8 +149,11 @@ internal sealed class GmailQuotaGovernor
                 return;
             }
 
+            var pausePoint = priority == GmailRequestPriority.Background
+                ? BackgroundUnitsPerMinute
+                : InteractiveUnitsPerMinute;
             status?.Invoke(
-                $"Quota guard is pacing Gmail sync ({snapshot.RollingMinuteUnits:N0}/{snapshot.BackgroundMinuteBudget:N0} background units). Resuming in {Math.Max(1, delay.TotalSeconds):0} seconds.");
+                $"Quota guard is pacing Gmail requests ({snapshot.RollingMinuteUnits:N0}/{UserUnitsPerMinute:N0} units in the rolling minute; {priority.ToString().ToLowerInvariant()} pause point {pausePoint:N0}). Resuming in {Math.Max(1, delay.TotalSeconds):0} seconds.");
             await Task.Delay(delay > TimeSpan.Zero ? delay : TimeSpan.FromMilliseconds(250), cancellationToken);
         }
     }

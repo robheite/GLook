@@ -16,7 +16,7 @@ using MimeKit.Utils;
 
 namespace GLook.Services;
 
-public sealed class GmailClientService
+public sealed class GmailClientService : IDisposable
 {
     private const int PermanentDeleteBatchSize = 50;
     private const int MaxIncrementalChangedThreads = 100;
@@ -55,8 +55,24 @@ public sealed class GmailClientService
 
     public event Action<GmailQuotaSnapshot>? QuotaSnapshotChanged;
 
+    public async Task<bool> HasStoredPrimaryAuthorizationAsync()
+    {
+        var token = await secureStore.GetAsync<TokenResponse?>(CredentialKey);
+        return token is not null
+            && (!string.IsNullOrWhiteSpace(token.AccessToken)
+                || !string.IsNullOrWhiteSpace(token.RefreshToken));
+    }
+
     public async Task<GmailAccountProfile?> TryReconnectAsync(CancellationToken cancellationToken = default)
     {
+        if (gmail is not null && !string.IsNullOrWhiteSpace(connectedEmailAddress))
+        {
+            // Account sessions live for the lifetime of the app. Reusing an
+            // already validated service avoids another users.getProfile call on
+            // every background multi-account sync and account switch.
+            return new GmailAccountProfile(connectedEmailAddress, 0);
+        }
+
         var clientJson = LoadPackagedClientSecrets()
             ?? await secureStore.GetAsync<string>(ClientSecretsKey);
         if (string.IsNullOrWhiteSpace(clientJson))
@@ -151,6 +167,56 @@ public sealed class GmailClientService
         return await ActivatePrimaryCredentialAsync(credential, cancellationToken);
     }
 
+    public async Task<GmailAccountProfile> ReauthorizeAsync(
+        string expectedEmailAddress,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(expectedEmailAddress);
+        var previousToken = await secureStore.GetAsync<TokenResponse?>(CredentialKey);
+        DisposePrimaryClient();
+        await secureStore.DeleteAsync<TokenResponse>(CredentialKey);
+
+        try
+        {
+            var profile = await ConnectAsync(cancellationToken);
+            if (!string.Equals(
+                    profile.EmailAddress,
+                    expectedEmailAddress,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"Google authorized {profile.EmailAddress}, but this mailbox is {expectedEmailAddress}.");
+            }
+
+            return profile;
+        }
+        catch
+        {
+            DisposePrimaryClient();
+            await secureStore.DeleteAsync<TokenResponse>(CredentialKey);
+            if (previousToken is not null)
+            {
+                await secureStore.StoreAsync(CredentialKey, previousToken);
+                try
+                {
+                    _ = await TryReconnectAsync(CancellationToken.None);
+                }
+                catch
+                {
+                    // The prior token remains stored even if Gmail is currently unreachable.
+                }
+            }
+
+            throw;
+        }
+    }
+
+    public async Task ForgetPrimaryAuthorizationAsync()
+    {
+        DisposePrimaryClient();
+        await secureStore.DeleteAsync<TokenResponse>(CredentialKey);
+    }
+
     private async Task<GmailAccountProfile> ActivatePrimaryCredentialAsync(
         UserCredential credential,
         CancellationToken cancellationToken)
@@ -190,7 +256,10 @@ public sealed class GmailClientService
             status: null,
             cancellationToken);
         var labels = response.Labels ?? [];
-        await ApplyUnreadCountsAsync(service, labels, cancellationToken);
+        await ApplyUnreadCountsAsync(
+            service,
+            labels.Where(NeedsFolderCounts),
+            cancellationToken);
 
         var folders = labels
             .Where(label => ShouldShowLabel(label))
@@ -501,8 +570,10 @@ public sealed class GmailClientService
         ArgumentException.ThrowIfNullOrWhiteSpace(threadId);
         var service = RequireClient();
         var request = service.Users.Threads.Get(UserId, threadId);
-        request.Format = UsersResource.ThreadsResource.GetRequest.FormatEnum.Metadata;
-        request.MetadataHeaders = new[] { "From", "To", "Cc", "Subject", "Date", "Message-Id", "References" };
+        // A full thread response already contains every message payload. Fetching
+        // metadata first and then each message separately wastes 20 units per
+        // message and makes long conversations noticeably slower.
+        request.Format = UsersResource.ThreadsResource.GetRequest.FormatEnum.Full;
         var thread = await quotaGovernor.ExecuteAsync(
             GmailApiMethod.ThreadsGet,
             GmailRequestPriority.Interactive,
@@ -515,16 +586,8 @@ public sealed class GmailClientService
         var selectedMessages = orderedMessages.TakeLast(MailResourceLimits.MaxThreadMessages).ToList();
         var loadedMessages = new List<MailMessage>(selectedMessages.Count);
         long totalBodyBytes = 0;
-        foreach (var summary in selectedMessages.AsEnumerable().Reverse())
+        foreach (var message in selectedMessages.AsEnumerable().Reverse())
         {
-            var messageRequest = service.Users.Messages.Get(UserId, summary.Id);
-            messageRequest.Format = UsersResource.MessagesResource.GetRequest.FormatEnum.Full;
-            var message = await quotaGovernor.ExecuteAsync(
-                GmailApiMethod.MessagesGet,
-                GmailRequestPriority.Interactive,
-                () => messageRequest.ExecuteAsync(cancellationToken),
-                status: null,
-                cancellationToken);
             var body = await ExtractBodyContentAsync(message, cancellationToken);
             var bodyBytes = Encoding.UTF8.GetByteCount(body.Text)
                 + (body.Html is null ? 0 : Encoding.UTF8.GetByteCount(body.Html));
@@ -1330,10 +1393,7 @@ public sealed class GmailClientService
 
     public async Task DisconnectAsync()
     {
-        gmail?.Dispose();
-        gmail = null;
-        primaryAuthorizationFlow?.Dispose();
-        primaryAuthorizationFlow = null;
+        DisposePrimaryClient();
         gmailSettings?.Dispose();
         gmailSettings = null;
         gmailPermanentDelete?.Dispose();
@@ -1342,6 +1402,26 @@ public sealed class GmailClientService
         labelUnreadCounts.Clear();
         labelUnreadCountsExpiresAt = DateTimeOffset.MinValue;
         await secureStore.ClearAsync();
+    }
+
+    private void DisposePrimaryClient()
+    {
+        gmail?.Dispose();
+        gmail = null;
+        primaryAuthorizationFlow?.Dispose();
+        primaryAuthorizationFlow = null;
+        connectedEmailAddress = null;
+        labelUnreadCounts.Clear();
+        labelUnreadCountsExpiresAt = DateTimeOffset.MinValue;
+    }
+
+    public void Dispose()
+    {
+        DisposePrimaryClient();
+        gmailSettings?.Dispose();
+        gmailSettings = null;
+        gmailPermanentDelete?.Dispose();
+        gmailPermanentDelete = null;
     }
 
     private async Task<GmailService> EnsureSettingsClientAsync(CancellationToken cancellationToken)
@@ -1518,8 +1598,13 @@ public sealed class GmailClientService
         ArgumentException.ThrowIfNullOrWhiteSpace(threadId);
         var service = RequireClient();
         var request = service.Users.Threads.Get(UserId, threadId);
-        request.Format = UsersResource.ThreadsResource.GetRequest.FormatEnum.Metadata;
-        request.MetadataHeaders = new[] { "From", "To", "Cc", "Reply-To", "Subject", "Date", "Message-Id", "References" };
+        request.Format = includeContent
+            ? UsersResource.ThreadsResource.GetRequest.FormatEnum.Full
+            : UsersResource.ThreadsResource.GetRequest.FormatEnum.Metadata;
+        if (!includeContent)
+        {
+            request.MetadataHeaders = new[] { "From", "To", "Cc", "Reply-To", "Subject", "Date", "Message-Id", "References" };
+        }
         var thread = await quotaGovernor.ExecuteAsync(
             GmailApiMethod.ThreadsGet,
             GmailRequestPriority.Interactive,
@@ -1530,19 +1615,7 @@ public sealed class GmailClientService
             .OrderByDescending(message => message.InternalDate ?? 0)
             .FirstOrDefault()
             ?? throw new InvalidOperationException("The selected conversation does not contain a message.");
-        if (!includeContent)
-        {
-            return latest;
-        }
-
-        var messageRequest = service.Users.Messages.Get(UserId, latest.Id);
-        messageRequest.Format = UsersResource.MessagesResource.GetRequest.FormatEnum.Full;
-        return await quotaGovernor.ExecuteAsync(
-            GmailApiMethod.MessagesGet,
-            GmailRequestPriority.Interactive,
-            () => messageRequest.ExecuteAsync(cancellationToken),
-            status: null,
-            cancellationToken);
+        return latest;
     }
 
     private async Task<IReadOnlyList<MailAttachmentInput>> GetMessageAttachmentsAsync(
@@ -1851,6 +1924,13 @@ public sealed class GmailClientService
         label.Type == "user"
         || label.Id is "INBOX" or "STARRED" or "SENT" or "DRAFT" or "IMPORTANT" or "SPAM" or "TRASH"
         || IsVisibleCategory(label);
+
+    private static bool NeedsFolderCounts(Label label) =>
+        label.Type == "user"
+        || label.Id is "INBOX" or "STARRED" or "SENT" or "DRAFT" or "IMPORTANT" or "SPAM" or "TRASH"
+        || (label.Id.StartsWith("CATEGORY_", StringComparison.Ordinal)
+            && (string.Equals(label.LabelListVisibility, "labelShow", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(label.LabelListVisibility, "labelShowIfUnread", StringComparison.OrdinalIgnoreCase)));
 
     private static bool IsVisibleCategory(Label label)
     {

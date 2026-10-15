@@ -12,6 +12,7 @@ public sealed record NotificationDeliveryResult(
 
 public sealed class WindowsNotificationService : IDisposable
 {
+    private const string NotificationIconResourceName = "GLook.NotificationIcon";
     private readonly AppNotificationManager manager = AppNotificationManager.Default;
     private bool isRegistered;
 
@@ -33,7 +34,8 @@ public sealed class WindowsNotificationService : IDisposable
         try
         {
             manager.NotificationInvoked += NotificationInvoked;
-            manager.Register();
+            var iconPath = EnsureNotificationIcon();
+            manager.Register("GLook", new Uri(iconPath));
             isRegistered = true;
             RegistrationError = null;
             return true;
@@ -44,6 +46,26 @@ public sealed class WindowsNotificationService : IDisposable
             RegistrationError = ex.GetBaseException().Message;
             return false;
         }
+    }
+
+    private static string EnsureNotificationIcon()
+    {
+        var iconPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "GLook",
+            "notification-icon.ico");
+        Directory.CreateDirectory(Path.GetDirectoryName(iconPath)!);
+
+        using var resource = typeof(WindowsNotificationService).Assembly
+            .GetManifestResourceStream(NotificationIconResourceName)
+            ?? throw new InvalidOperationException("The embedded GLook notification icon is unavailable.");
+        using var destination = new FileStream(
+            iconPath,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.Read);
+        resource.CopyTo(destination);
+        return iconPath;
     }
 
     public void ShowNewMail(MailThreadSummary thread, string? accountEmail = null)
@@ -85,16 +107,18 @@ public sealed class WindowsNotificationService : IDisposable
             return new NotificationDeliveryResult(false, false, setting, GetSettingMessage(setting));
         }
 
-        const string tag = "notification-test";
         const string group = "glook-diagnostics";
+        await manager.RemoveByGroupAsync(group);
+        var tag = $"test-{Guid.NewGuid():N}"[..13];
         var notification = new AppNotificationBuilder()
             .AddArgument("action", "notificationTest")
             .AddText("GLook notifications are working")
-            .AddText("Windows accepted this test notification from GLook.")
+            .AddText($"Fresh test sent at {DateTimeOffset.Now:t}.")
             .BuildNotification();
         notification.Tag = tag;
         notification.Group = group;
         notification.Priority = AppNotificationPriority.High;
+        notification.SuppressDisplay = false;
 
         manager.Show(notification);
         await Task.Delay(500, cancellationToken);

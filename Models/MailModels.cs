@@ -143,6 +143,8 @@ public sealed record MailMessage(
 
 public sealed class MailThreadGroup : ObservableCollection<MailThreadSummary>
 {
+    private readonly List<MailThreadSummary> allThreads;
+
     public MailThreadGroup(
         string key,
         string title,
@@ -152,7 +154,7 @@ public sealed class MailThreadGroup : ObservableCollection<MailThreadSummary>
     {
         Key = key;
         Title = title;
-        AllThreads = threads.ToList();
+        allThreads = threads.ToList();
         IsCollapsed = isCollapsed;
     }
 
@@ -160,7 +162,7 @@ public sealed class MailThreadGroup : ObservableCollection<MailThreadSummary>
 
     public string Title { get; }
 
-    public IReadOnlyList<MailThreadSummary> AllThreads { get; }
+    public IReadOnlyList<MailThreadSummary> AllThreads => allThreads;
 
     public int TotalCount => AllThreads.Count;
 
@@ -171,6 +173,28 @@ public sealed class MailThreadGroup : ObservableCollection<MailThreadSummary>
     public string AutomationName => $"{Title}, {(IsCollapsed ? "collapsed" : "expanded")}";
 
     public string ToggleHelpText => IsCollapsed ? "Expand this message group" : "Collapse this message group";
+
+    public bool ReplaceThread(MailThreadSummary replacement)
+    {
+        var allIndex = allThreads.FindIndex(thread => thread.Id == replacement.Id);
+        if (allIndex < 0)
+        {
+            return false;
+        }
+
+        allThreads[allIndex] = replacement;
+        if (!IsCollapsed)
+        {
+            var visible = this.FirstOrDefault(thread => thread.Id == replacement.Id);
+            var visibleIndex = visible is null ? -1 : IndexOf(visible);
+            if (visibleIndex >= 0)
+            {
+                this[visibleIndex] = replacement;
+            }
+        }
+
+        return true;
+    }
 }
 
 public sealed record MailSignature(
