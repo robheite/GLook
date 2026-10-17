@@ -4,7 +4,7 @@ GLook is a native Windows mail client that treats Gmail as the source of truth. 
 
 ## Current release
 
-The current prerelease is **GLook v1.1.0**. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for the complete change list and upgrade notes.
+The current prerelease is **GLook v1.2.0**. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for the complete change list and upgrade notes. The repository also includes the evidence-backed [October 2026 deep-dive review](docs/reviews/2026-10-17-deep-dive-review.md), including implemented fixes and remaining environmental validation boundaries.
 
 ## Application foundation
 
@@ -34,10 +34,12 @@ The first working slice includes:
 - right-clicking Gmail Trash exposes **Empty Trash…**, which shows the live message count and requires explicit confirmation before permanent deletion;
 - DPAPI-encrypted SQLite cache for recent conversation summaries and offline fallback;
 - true nested label navigation with preserved expansion and scroll position;
-- quota-governed Gmail history synchronization with a DPAPI-protected per-account cursor and a bounded recovery path when Gmail expires old history;
+- quota-governed Gmail history synchronization with format-aware unit estimates, an encrypted rolling ledger, resumable bounded catch-up checkpoints, and non-destructive cache recovery when Gmail expires old history;
 - multiple Gmail mailboxes with isolated OAuth credentials, cache partitions, signatures, sync/notification preferences, ordering, reauthorization, and safe per-account removal;
+- drag-and-drop from the conversation list to eligible Gmail labels, with Move by default and Ctrl-drop to add a label without removing the current one;
 - an optional Board view with a mailbox selector, user-editable workflow headings, explicit per-mailbox Gmail-label mappings, and separate **Move** versus **Add label** actions;
-- Windows new-mail notifications while GLook is running, with a test control and configurable automatic sync (five minutes by default);
+- Windows new-mail notifications while GLook is running, with per-mailbox persisted controls, activation into the originating mailbox/conversation, a test control, and configurable automatic sync (five minutes by default);
+- privacy-safe diagnostics export for account, sync, cache, quota, and error state without OAuth tokens or message bodies;
 - light, dark, and high-contrast-aware resources.
 
 This is an application foundation, not yet a complete Outlook replacement. Reopening existing Gmail drafts, snooze, rules, contacts/calendar, offline mutation queues, push/closed-app synchronization, and multiple simultaneous accounts remain future work.

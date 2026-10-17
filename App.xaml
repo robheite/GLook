@@ -20,7 +20,7 @@
                     <SolidColorBrush x:Key="GLookThreadBrush" Color="#F7FAFF" />
                     <SolidColorBrush x:Key="GLookReadingBrush" Color="#FCFDFF" />
                     <SolidColorBrush x:Key="GLookSeparatorBrush" Color="#244B6FA8" />
-                    <SolidColorBrush x:Key="GLookMutedBrush" Color="#66758F" />
+                    <SolidColorBrush x:Key="GLookMutedBrush" Color="#52627A" />
                     <SolidColorBrush x:Key="GLookBrandBrush" Color="#0D5BD7" />
                     <SolidColorBrush x:Key="GLookBrandStrongBrush" Color="#0A3F9A" />
                     <SolidColorBrush x:Key="GLookBrandSoftBrush" Color="#DCEAFF" />

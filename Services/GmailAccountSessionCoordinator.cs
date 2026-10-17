@@ -69,10 +69,7 @@ public sealed class GmailAccountSessionCoordinator : IAsyncDisposable
             return Task.CompletedTask;
         }
 
-        foreach (var sourcePath in Directory.EnumerateFiles(
-                     credentialDirectory,
-                     "*.bin",
-                     SearchOption.TopDirectoryOnly))
+        foreach (var sourcePath in EnumerateCredentialFiles(credentialDirectory))
         {
             cancellationToken.ThrowIfCancellationRequested();
             var destinationPath = Path.Combine(
@@ -479,10 +476,7 @@ public sealed class GmailAccountSessionCoordinator : IAsyncDisposable
     private static void CopyMissingCredentialFiles(string sourceDirectory, string destinationDirectory)
     {
         Directory.CreateDirectory(destinationDirectory);
-        foreach (var sourcePath in Directory.EnumerateFiles(
-                     sourceDirectory,
-                     "*.bin",
-                     SearchOption.TopDirectoryOnly))
+        foreach (var sourcePath in EnumerateCredentialFiles(sourceDirectory))
         {
             var destinationPath = Path.Combine(destinationDirectory, Path.GetFileName(sourcePath));
             if (!File.Exists(destinationPath))
@@ -491,6 +485,11 @@ public sealed class GmailAccountSessionCoordinator : IAsyncDisposable
             }
         }
     }
+
+    internal static IEnumerable<string> EnumerateCredentialFiles(string directory) =>
+        Directory.EnumerateFiles(directory, "*.bin", SearchOption.TopDirectoryOnly)
+            .Concat(Directory.EnumerateFiles(directory, "*.bin.bak", SearchOption.TopDirectoryOnly))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
 
     private LocalMailStore CreateBoundMailStore(Guid accountId)
     {

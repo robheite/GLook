@@ -79,6 +79,10 @@ public sealed class FolderTreeItem
 
     public string CountText => CountOverride ?? Folder?.CountText ?? string.Empty;
 
+    public string AutomationName => string.IsNullOrWhiteSpace(CountText)
+        ? Name
+        : $"{Name}, {CountText.Trim('(', ')')} unread";
+
     public bool IsSelectable => !IsPlaceholder && (Folder is not null || IsMailboxRoot);
 }
 
@@ -95,6 +99,11 @@ public sealed record MailThreadSummary(
     public string UnreadMarker => IsUnread ? "●" : string.Empty;
 
     public string StarMarker => IsStarred ? "★" : string.Empty;
+
+    public string AutomationName =>
+        $"{(IsUnread ? "Unread" : "Read")} conversation from {Sender}: {Subject}";
+
+    public string SelectionAutomationName => $"Select conversation from {Sender}: {Subject}";
 
     public string ReceivedText
     {
@@ -131,6 +140,8 @@ public sealed record MailMessage(
     public string? BodyHtml { get; init; }
 
     public string Cc { get; init; } = string.Empty;
+
+    public string ReplyTo { get; init; } = string.Empty;
 
     public string? RfcMessageId { get; init; }
 
@@ -254,7 +265,8 @@ public sealed record GmailHistorySyncResult(
     IReadOnlyList<MailThreadSummary> UpsertedThreads,
     IReadOnlyList<string> RemovedThreadIds,
     IReadOnlyList<MailThreadSummary> NotificationCandidates,
-    bool RequiresBootstrap = false)
+    bool RequiresBootstrap = false,
+    bool HistoryCatchUpPending = false)
 {
     public int ChangedThreadCount => UpsertedThreads.Count + RemovedThreadIds.Count;
 }

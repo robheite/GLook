@@ -17,9 +17,9 @@
         <RootNamespace>GLook</RootNamespace>
 
         <!-- Release identity -->
-        <Version>1.1.0</Version>
-        <AssemblyVersion>1.1.0.0</AssemblyVersion>
-        <FileVersion>1.1.0.0</FileVersion>
+        <Version>1.2.0</Version>
+        <AssemblyVersion>1.2.0.0</AssemblyVersion>
+        <FileVersion>1.2.0.0</FileVersion>
 
         <!-- App Options -->
         <UseRidGraph>true</UseRidGraph>
@@ -55,9 +55,9 @@
 
     <ItemGroup>
         <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
-        <PackageReference Include="Google.Apis.Gmail.v1" Version="1.75.0.4225" />
-        <PackageReference Include="HtmlAgilityPack" Version="1.13.0" />
-        <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+        <PackageReference Include="Google.Apis.Gmail.v1" Version="1.77.0.4295" />
+        <PackageReference Include="HtmlAgilityPack" Version="1.13.1" />
+        <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.13" />
         <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260921001" />
         <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4258.31" />
         <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2705" />
@@ -68,7 +68,7 @@
 
         <!-- Override MimeKit's vulnerable 10.0.0 transitive dependency. -->
         <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.13" />
-        <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.12" />
+        <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.13" />
     </ItemGroup>
 
     <!--

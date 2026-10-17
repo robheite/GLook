@@ -15,17 +15,20 @@ internal enum GmailApiMethod
     LabelsUpdate,
     ThreadsList,
     ThreadsGet,
+    ThreadsGetFull,
     ThreadsModify,
     ThreadsTrash,
     ThreadsUntrash,
     MessagesList,
     MessagesGet,
+    MessagesGetFull,
     MessageAttachmentsGet,
     MessagesSend,
     MessagesBatchDelete,
     DraftsCreate,
     DraftsDelete,
     DraftsGet,
+    DraftsGetFull,
     DraftsSend,
     DraftsUpdate,
     SettingsSendAsList,
@@ -45,6 +48,7 @@ internal enum GmailRequestPriority
 /// </summary>
 internal sealed class GmailQuotaGovernor
 {
+    private const string UsageLedgerKey = "gmail-quota-ledger-v1";
     internal const int UserUnitsPerMinute = 6_000;
     internal const int BackgroundUnitsPerMinute = 4_500;
     private const int InteractiveUnitsPerMinute = 5_800;
@@ -54,7 +58,15 @@ internal sealed class GmailQuotaGovernor
     private readonly object usageLock = new();
     private readonly Queue<UsageEntry> minuteUsage = new();
     private readonly Queue<UsageEntry> dayUsage = new();
+    private readonly EncryptedDataStore? ledgerStore;
+    private readonly SemaphoreSlim ledgerGate = new(1, 1);
+    private bool ledgerLoaded;
     private GmailQuotaState state = GmailQuotaState.Normal;
+
+    public GmailQuotaGovernor(EncryptedDataStore? ledgerStore = null)
+    {
+        this.ledgerStore = ledgerStore;
+    }
 
     public event Action<GmailQuotaSnapshot>? SnapshotChanged;
 
@@ -102,6 +114,18 @@ internal sealed class GmailQuotaGovernor
                     $"Gmail is temporarily limiting requests. Retrying in {delay.TotalSeconds:0} seconds.");
                 await Task.Delay(delay, cancellationToken);
             }
+            catch (GoogleApiException ex) when (
+                IsTransientServerFailure(ex)
+                && IsSafeToRetry(method)
+                && attempt < MaximumAttempts - 1)
+            {
+                var delay = TimeSpan.FromSeconds(Math.Min(Math.Pow(2, attempt + 1), 16))
+                    + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 751));
+                SetState(GmailQuotaState.WaitingForGmail);
+                status?.Invoke(
+                    $"Gmail returned a temporary server error. Retrying in {delay.TotalSeconds:0} seconds.");
+                await Task.Delay(delay, cancellationToken);
+            }
         }
     }
 
@@ -111,6 +135,7 @@ internal sealed class GmailQuotaGovernor
         Action<string>? status,
         CancellationToken cancellationToken)
     {
+        await EnsureLedgerLoadedAsync(cancellationToken);
         while (true)
         {
             var delay = TimeSpan.Zero;
@@ -146,6 +171,7 @@ internal sealed class GmailQuotaGovernor
             SnapshotChanged?.Invoke(snapshot);
             if (reserved)
             {
+                await PersistLedgerAsync(cancellationToken);
                 return;
             }
 
@@ -155,6 +181,81 @@ internal sealed class GmailQuotaGovernor
             status?.Invoke(
                 $"Quota guard is pacing Gmail requests ({snapshot.RollingMinuteUnits:N0}/{UserUnitsPerMinute:N0} units in the rolling minute; {priority.ToString().ToLowerInvariant()} pause point {pausePoint:N0}). Resuming in {Math.Max(1, delay.TotalSeconds):0} seconds.");
             await Task.Delay(delay > TimeSpan.Zero ? delay : TimeSpan.FromMilliseconds(250), cancellationToken);
+        }
+    }
+
+    private async Task EnsureLedgerLoadedAsync(CancellationToken cancellationToken)
+    {
+        if (ledgerLoaded || ledgerStore is null)
+        {
+            ledgerLoaded = true;
+            return;
+        }
+
+        await ledgerGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (ledgerLoaded)
+            {
+                return;
+            }
+
+            IReadOnlyList<UsageEntry>? retained = null;
+            try
+            {
+                retained = await ledgerStore.GetAsync<List<UsageEntry>>(UsageLedgerKey);
+            }
+            catch (InvalidDataException)
+            {
+                await ledgerStore.DeleteAsync<List<UsageEntry>>(UsageLedgerKey);
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            lock (usageLock)
+            {
+                foreach (var entry in (retained ?? []).Where(entry =>
+                             entry.Units > 0 && now - entry.Timestamp >= TimeSpan.Zero && now - entry.Timestamp < RollingDay))
+                {
+                    dayUsage.Enqueue(entry);
+                    if (now - entry.Timestamp < RollingMinute)
+                    {
+                        minuteUsage.Enqueue(entry);
+                    }
+                }
+
+                PruneUsage(now);
+            }
+
+            ledgerLoaded = true;
+        }
+        finally
+        {
+            ledgerGate.Release();
+        }
+    }
+
+    private async Task PersistLedgerAsync(CancellationToken cancellationToken)
+    {
+        if (ledgerStore is null)
+        {
+            return;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        await ledgerGate.WaitAsync(cancellationToken);
+        try
+        {
+            UsageEntry[] entries;
+            lock (usageLock)
+            {
+                entries = dayUsage.ToArray();
+            }
+
+            await ledgerStore.StoreAsync(UsageLedgerKey, entries);
+        }
+        finally
+        {
+            ledgerGate.Release();
         }
     }
 
@@ -202,23 +303,48 @@ internal sealed class GmailQuotaGovernor
         GmailApiMethod.LabelsUpdate => 5,
         GmailApiMethod.ThreadsList => 10,
         GmailApiMethod.ThreadsGet => 40,
+        GmailApiMethod.ThreadsGetFull => 120,
         GmailApiMethod.ThreadsModify => 10,
         GmailApiMethod.ThreadsTrash => 20,
         GmailApiMethod.ThreadsUntrash => 10,
         GmailApiMethod.MessagesList => 5,
         GmailApiMethod.MessagesGet => 20,
+        GmailApiMethod.MessagesGetFull => 60,
         GmailApiMethod.MessageAttachmentsGet => 20,
         GmailApiMethod.MessagesSend => 100,
         GmailApiMethod.MessagesBatchDelete => 50,
         GmailApiMethod.DraftsCreate => 10,
         GmailApiMethod.DraftsDelete => 10,
         GmailApiMethod.DraftsGet => 20,
+        GmailApiMethod.DraftsGetFull => 60,
         GmailApiMethod.DraftsSend => 100,
         GmailApiMethod.DraftsUpdate => 15,
         GmailApiMethod.SettingsSendAsList => 1,
         GmailApiMethod.SettingsSendAsUpdate => 100,
         _ => throw new ArgumentOutOfRangeException(nameof(method), method, null)
     };
+
+    private static bool IsSafeToRetry(GmailApiMethod method) => method is
+        GmailApiMethod.GetProfile
+        or GmailApiMethod.HistoryList
+        or GmailApiMethod.LabelsList
+        or GmailApiMethod.LabelsGet
+        or GmailApiMethod.ThreadsList
+        or GmailApiMethod.ThreadsGet
+        or GmailApiMethod.ThreadsGetFull
+        or GmailApiMethod.MessagesList
+        or GmailApiMethod.MessagesGet
+        or GmailApiMethod.MessagesGetFull
+        or GmailApiMethod.MessageAttachmentsGet
+        or GmailApiMethod.DraftsGet
+        or GmailApiMethod.DraftsGetFull
+        or GmailApiMethod.SettingsSendAsList;
+
+    private static bool IsTransientServerFailure(GoogleApiException exception) =>
+        exception.HttpStatusCode is HttpStatusCode.InternalServerError
+            or HttpStatusCode.BadGateway
+            or HttpStatusCode.ServiceUnavailable
+            or HttpStatusCode.GatewayTimeout;
 
     private static bool IsQuotaLimit(GoogleApiException exception) =>
         exception.HttpStatusCode == HttpStatusCode.TooManyRequests

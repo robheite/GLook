@@ -5,6 +5,7 @@ using System.Text.Json;
 using Google;
 using GLook.Models;
 using GLook.ViewModels;
+using GLook.Views;
 using Microsoft.Windows.AppNotifications;
 
 namespace GLook.Services;
@@ -95,6 +96,9 @@ public static class AppSelfTestRunner
         {
             if (GmailQuotaGovernor.UnitsFor(GmailApiMethod.HistoryList) != 2
                 || GmailQuotaGovernor.UnitsFor(GmailApiMethod.ThreadsGet) != 40
+                || GmailQuotaGovernor.UnitsFor(GmailApiMethod.ThreadsGetFull) != 120
+                || GmailQuotaGovernor.UnitsFor(GmailApiMethod.MessagesGetFull) != 60
+                || GmailQuotaGovernor.UnitsFor(GmailApiMethod.DraftsGetFull) != 60
                 || GmailQuotaGovernor.BackgroundUnitsPerMinute != 4_500)
             {
                 throw new InvalidOperationException("Gmail quota weights or the background reserve changed unexpectedly.");
@@ -160,6 +164,38 @@ public static class AppSelfTestRunner
                     throw new InvalidOperationException("The retained folder tree, refresh timestamp, and hydration marker could not be loaded after its scope migration.");
                 }
 
+                var olderRetained = thread with
+                {
+                    Id = "older-retained",
+                    ReceivedAt = DateTimeOffset.UtcNow.AddDays(-10),
+                    LabelIds = ["INBOX"]
+                };
+                var recentStale = thread with
+                {
+                    Id = "recent-stale",
+                    ReceivedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+                    LabelIds = ["INBOX"]
+                };
+                var recentCurrent = thread with
+                {
+                    Id = "recent-current",
+                    ReceivedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+                    LabelIds = ["INBOX"]
+                };
+                await testStore.SaveThreadsAsync([olderRetained, recentStale, recentCurrent]);
+                await testStore.SaveFolderSnapshotAsync(
+                    "INBOX",
+                    [recentCurrent],
+                    reconcileMissing: false,
+                    reconcileMissingOnOrAfter: DateTimeOffset.UtcNow.AddHours(-1));
+                var reconciledInbox = await testStore.LoadThreadsAsync("INBOX", 10);
+                if (reconciledInbox.Any(item => item.Id == recentStale.Id)
+                    || !reconciledInbox.Any(item => item.Id == recentCurrent.Id)
+                    || !reconciledInbox.Any(item => item.Id == olderRetained.Id))
+                {
+                    throw new InvalidOperationException("Bounded folder reconciliation did not remove only stale rows inside the refreshed recent window.");
+                }
+
                 await testStore.ApplyHistorySyncAsync(
                     new GmailHistorySyncResult(102, 103, [thread], [], []),
                     replaceAccountSnapshot: true);
@@ -190,11 +226,90 @@ public static class AppSelfTestRunner
                 var registry = new AccountRegistry(Path.Combine(testDirectory, "secure"));
                 var first = await registry.AddAsync(Guid.NewGuid(), "first@example.invalid", "First mailbox");
                 var second = await registry.AddAsync(Guid.NewGuid(), "second@example.invalid", "Second mailbox");
-                await registry.SetOrderAsync([second.AccountId, first.AccountId]);
+                var third = await registry.AddAsync(Guid.NewGuid(), "third@example.invalid", "Third mailbox");
+                await registry.SetOrderAsync([second.AccountId, first.AccountId, third.AccountId]);
                 var accounts = await registry.GetAccountsAsync();
-                if (accounts.Count != 2 || accounts[0].AccountId != second.AccountId)
+                if (accounts.Count != 3 || accounts[0].AccountId != second.AccountId)
                 {
                     throw new InvalidOperationException("Account ordering or stable identities were not preserved.");
+                }
+
+                var quotaSnapshot = new GmailQuotaSnapshot(
+                    GmailQuotaState.Normal,
+                    0,
+                    0,
+                    GmailQuotaGovernor.BackgroundUnitsPerMinute,
+                    DateTimeOffset.UtcNow);
+                var firstSettings = new AccountSettingsItemViewModel(first, quotaSnapshot);
+                var secondSettings = new AccountSettingsItemViewModel(second, quotaSnapshot);
+                var thirdSettings = new AccountSettingsItemViewModel(third, quotaSnapshot);
+                firstSettings.ApplyNotificationsToggleValue(false);
+                secondSettings.ApplyAutomaticSyncToggleValue(false);
+                thirdSettings.ApplyAutomaticSyncToggleValue(false);
+                thirdSettings.ApplyNotificationsToggleValue(false);
+                if (!firstSettings.HasEditableChanges
+                    || !secondSettings.HasEditableChanges
+                    || !thirdSettings.HasEditableChanges)
+                {
+                    throw new InvalidOperationException(
+                        "A toggle change was not recognized as a pending per-account preference update.");
+                }
+
+                _ = firstSettings.ToRegistration();
+                if (!firstSettings.HasEditableChanges)
+                {
+                    throw new InvalidOperationException(
+                        "Preparing an account action incorrectly marked unsaved preferences as persisted.");
+                }
+
+                var firstUpdated = await registry.UpdatePreferencesAsync(
+                    first.AccountId,
+                    firstSettings.DisplayName,
+                    firstSettings.AutomaticSyncEnabled,
+                    firstSettings.NotificationsEnabled);
+                var secondUpdated = await registry.UpdatePreferencesAsync(
+                    second.AccountId,
+                    secondSettings.DisplayName,
+                    secondSettings.AutomaticSyncEnabled,
+                    secondSettings.NotificationsEnabled);
+                var thirdUpdated = await registry.UpdatePreferencesAsync(
+                    third.AccountId,
+                    thirdSettings.DisplayName,
+                    thirdSettings.AutomaticSyncEnabled,
+                    thirdSettings.NotificationsEnabled);
+                firstSettings.AcceptRegistration(firstUpdated);
+                secondSettings.AcceptRegistration(secondUpdated);
+                thirdSettings.AcceptRegistration(thirdUpdated);
+                if (firstSettings.HasEditableChanges
+                    || secondSettings.HasEditableChanges
+                    || thirdSettings.HasEditableChanges)
+                {
+                    throw new InvalidOperationException(
+                        "Saved per-account preference updates remained incorrectly marked as pending.");
+                }
+
+                var reloadedRegistry = new AccountRegistry(Path.Combine(testDirectory, "secure"));
+                var reloaded = (await reloadedRegistry.GetAccountsAsync())
+                    .ToDictionary(account => account.AccountId);
+                if (reloaded[first.AccountId].NotificationsEnabled
+                    || !reloaded[first.AccountId].AutomaticSyncEnabled
+                    || !reloaded[second.AccountId].NotificationsEnabled
+                    || reloaded[second.AccountId].AutomaticSyncEnabled
+                    || reloaded[third.AccountId].NotificationsEnabled
+                    || reloaded[third.AccountId].AutomaticSyncEnabled)
+                {
+                    throw new InvalidOperationException(
+                        "Per-account sync and notification preferences did not survive an encrypted registry reload independently.");
+                }
+
+                if (AccountNotificationPolicy.ShouldPublish(first.AccountId, reloaded[first.AccountId])
+                    || !AccountNotificationPolicy.ShouldPublish(second.AccountId, reloaded[second.AccountId])
+                    || AccountNotificationPolicy.ShouldPublish(third.AccountId, reloaded[third.AccountId])
+                    || AccountNotificationPolicy.ShouldPublish(Guid.NewGuid(), account: null)
+                    || !AccountNotificationPolicy.ShouldPublish(requestedAccountId: null, account: null))
+                {
+                    throw new InvalidOperationException(
+                        "Notification delivery did not honor each persisted account preference independently.");
                 }
 
                 var coordinator = new GmailAccountSessionCoordinator(testDirectory);
@@ -253,7 +368,7 @@ public static class AppSelfTestRunner
                 }
             }
 
-            return "Account identities and ordering persist in the encrypted registry; Board headings remain independent from per-account Gmail label bindings.";
+            return "Account identities, ordering, and independent sync/notification preferences persist across an encrypted registry reload; Board headings remain independent from per-account Gmail label bindings.";
         });
 
         await RunCheckAsync(checks, "Windows notification registration", () =>

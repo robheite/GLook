@@ -1,68 +1,96 @@
-# GLook v1.1.0
+# GLook v1.2.0
 
-GLook v1.1.0 is a substantial reliability, efficiency, and mail-workflow update to the native Windows Gmail client. Gmail remains the source of truth, while the local encrypted cache now provides a faster and more resilient starting point between builds and syncs.
+GLook v1.2.0 is a reliability, security, synchronization-efficiency, and usability release for the native Windows Gmail client. It implements the required fixes from the October 17 deep-dive review while retaining Gmail as the source of truth and preserving existing encrypted local account data.
 
 This remains a prerelease build for hands-on testing. It is a portable, unpackaged, unsigned Windows x64 executable.
 
-## Gmail synchronization and API efficiency
+The full review, implementation matrix, test evidence, and remaining validation boundaries are documented in [`docs/reviews/2026-10-17-deep-dive-review.md`](docs/reviews/2026-10-17-deep-dive-review.md).
 
-- Reduced conversation-opening calls by loading a complete Gmail thread in one request and reusing cached details where possible.
-- Reused validated Gmail sessions instead of repeatedly requesting the account profile.
-- Changed mail actions to update the encrypted local cache immediately and defer confirmation to the next history sync, avoiding unnecessary folder-wide rereads.
-- Limited label-count calls to labels that are actually displayed.
-- Added a live bottom-bar Gmail API usage indicator and clarified that the figure is the active rolling-minute estimate against Google's 6,000 units-per-user-per-project limit.
-- Retained the 4,500-unit background-work pause point so foreground actions keep headroom.
+## Per-account notifications and settings persistence
 
-## Local cache and account recovery
+- Fixed the reported multi-account notification-toggle regression. Automatic-sync and Windows-notification settings now persist independently for every Gmail account.
+- Reads the actual toggle control state before saving, avoiding the WinUI event-order race that could write the previous value.
+- Serializes saves per account and makes **Done** wait for outstanding preference, add-account, removal, and reauthorization actions.
+- Keeps the last persisted registration separate from editable UI values, so opening an account action cannot incorrectly mark unsaved changes as saved.
+- Rechecks the encrypted persisted notification policy at delivery time and fails closed when the account cannot be resolved.
+- Notification activation now selects the originating mailbox and opens the cached conversation when available.
+- The notification test verifies that Windows accepted the notification and retained it in Notification Center.
 
-- Added encrypted folder snapshots and per-folder hydration state to SQLite.
-- Loads cached folders and conversations before reconnecting so retained mail remains visible while Gmail changes are checked.
-- Migrates legacy and email-keyed cache data into each account's stable account ID without discarding existing encrypted credentials.
-- Recovers retained DPAPI-protected account sessions and keeps the previous credential available if reauthorization fails.
-- Added SQLite integrity checks with recoverable backup/rebuild behavior for a damaged cache.
-- Improved Gmail client and session disposal.
+## Gmail synchronization and API-unit efficiency
 
-## Reading experience
+- Corrected Gmail API unit estimates for full thread, message, and draft reads.
+- Added an encrypted rolling unit ledger that survives process restarts and clarifies that the status-bar figure is a local estimate, not authoritative Google Cloud project telemetry.
+- Added bounded retries for transient read-only Gmail failures without retrying sends or destructive mutations.
+- Reworked history catch-up into resumable checkpoints. Large backlogs advance only through fully processed history records instead of repeatedly rebuilding the same 50-thread snapshot.
+- Processes a single oversized atomic Gmail history record intact while the rolling quota governor paces its summary reads.
+- Enforces page, event, changed-thread, and wall-clock bounds while reading history.
+- Keeps deeper cached summaries during expired-history recovery instead of replacing the account cache with a small bootstrap page.
+- Uses versioned folder-hydration provenance. Complete folder pages can be retained; partial 50-thread pages remain eligible for explicit revalidation and use a verified recent-window boundary in the active session.
+- Automatic background sync no longer rehydrates a partial selected folder on every timer tick, and performs no Gmail work when every account has automatic sync disabled.
+- Empty Trash now confirms current Trash membership through paginated list snapshots rather than individually rereading every message.
+- Label unread-count results are cached longer, known send/mutation state is projected locally, and scheduled history reconciliation replaces unnecessary immediate rereads.
 
-- Reworked HTML mail rendering around a protected WebView2 document origin so large formatted messages render without the prior blank-pane limitation.
-- Keeps scripts and unsafe navigation disabled and preserves the safe-text fallback.
-- Added a persistent **Always download external pictures** setting while retaining per-message image controls.
-- Preserves the message-list scroll position when opening mail.
-- Adds a clear, theme-aware active-conversation highlight.
-- Distinguishes unread mail with a tinted row and stronger sender, subject, and time typography; read mail uses the normal weight.
+## Cache, credentials, and account lifecycle
 
-## Selection and mail actions
+- Encrypted data files now use same-directory temporary writes, write-through flushing, atomic replacement, and a last-known-good backup.
+- Missing, unreadable, and corrupt encrypted data are handled separately instead of treating every failure as an empty registry.
+- Legacy credential migration and rollback preservation include both primary `.bin` files and `.bin.bak` recovery files.
+- Account-scoped Gmail work and its local cache projection share one operation gate. Removal and reauthorization wait for in-flight message, label, signature, draft, and synchronization work.
+- The bounded detail cache now evicts older conversation bodies instead of growing without limit.
+- Added privacy-safe diagnostics export covering accounts, synchronization, cache, quota, and error state without OAuth tokens or message bodies.
 
-- Decoupled checkboxes from WinUI's recycled list selection state to prevent stuck or visually stale checks.
-- Checkbox selection now drives the bulk-action toolbar consistently, including after scrolling and recycled-row reuse.
-- Normal row clicks select and open one conversation; bulk selection remains explicit through checkboxes.
-- Clears bulk selection when changing mailbox, folder, or search scope while leaving an opened conversation intact when appropriate.
-- Makes Archive, Delete, Read/Unread, Star, Move, and Labels available whenever checked conversations exist.
-- Applies mail actions to the local view immediately, then reconciles through Gmail history sync.
+## Authorization and message safety
 
-## Folder counts and visual states
+- Gmail signature/settings authorization is staged until Google identity, token signature, audience, and normalized email are verified against the selected mailbox.
+- Mismatched settings authorization is rejected before the credential can be persisted or used.
+- Conversation display is metadata-first and hydrates only the bounded messages needed for the reading pane.
+- Forwarding fetches only the latest selected message instead of downloading the complete conversation.
+- Reply and reply-all now retain and respect `Reply-To`.
+- MIME selection avoids text attachments, honors declared character sets, and keeps decoded body/attachment limits.
+- Remote fonts remain blocked even when the user permits remote email images.
+- HTML document construction runs away from the UI thread, and WebView process failure/unload paths now provide safe fallback and cleanup.
 
-- Sidebar counts now represent Gmail's unread-message count for Inbox, system folders, categories, and user labels rather than the total number of messages.
-- Added light, dark, and high-contrast resources for selected and unread conversation states.
+## Folder drag-and-drop and mail actions
 
-## Notifications and settings
+- Conversations can be dragged from the message list to eligible Gmail user labels, nested labels, or Inbox.
+- Drop defaults to folder-style **Move**; holding Ctrl performs **Add label** without removing the current folder label.
+- A checked multi-selection moves together; otherwise only the dragged row is changed.
+- Cross-account and unsafe system-label targets are rejected.
+- Drag payloads use per-drag tokens so canceled or stale drags cannot act on an earlier selection.
+- The existing keyboard-accessible Move and Labels commands remain equivalent alternatives.
 
-- Registers the embedded GLook icon for Windows notifications.
-- Makes test notifications unique, visible, high priority, and replace-safe in Notification Center.
-- Retains per-account automatic-sync and notification preferences.
+## UI, accessibility, and resilience
 
-## Authentication safeguards
+- Rapid A-to-B conversation opening now uses cancellation and a selection generation so an older request cannot replace the active message.
+- Read, unread, active, checked, focused, and hover states have distinct presentation.
+- Delete and toolbar commands use the checked action selection consistently.
+- Folder unread counts and Trash/Spam/restore transitions are projected immediately in the local mirror.
+- Improved light-theme muted-text contrast and reduced rigid dialog/Board sizing.
+- Added UI Automation names and help text for account cards, folder rows, conversation rows, checkboxes, Board controls, status, and commands.
+- Pane dividers support keyboard resizing and double-click reset in addition to pointer dragging.
+- WebView failure recovery, notification activation, and account-dialog completion paths are now explicit.
 
-- Reauthorization verifies that the returned Google identity matches the selected mailbox.
-- Restores the prior encrypted token if reauthorization is canceled, fails, or returns the wrong account.
+## Dependency maintenance
 
-## Validation and security
+- Updated Google.Apis.Gmail.v1 to 1.77.0.4295.
+- Updated HtmlAgilityPack to 1.13.1.
+- Updated Microsoft.Data.Sqlite and System.Security.Cryptography.ProtectedData to 10.0.13.
+- Kept the existing Windows App SDK generation to avoid combining these reliability changes with a major framework migration.
 
-- Expanded self-tests for retained-cache migration, folder snapshot/hydration behavior, and large HTML documents.
-- Updated `System.Security.Cryptography.Pkcs` to 10.0.13 to remove the vulnerable 10.0.0 transitive dependency reported by NuGet.
+## Verification
+
+- Release x64 analyzer build: passed with 0 warnings and 0 errors.
+- Formatting and whitespace verification: passed.
+- Packaged read-only self-test: passed 15/15 with `MailboxMutationsPerformed=false`.
+- Windows notification delivery test: passed and was retained in Notification Center.
+- Read-only **Sync All** integration test: passed.
+- NuGet vulnerable and deprecated package checks: no findings at publication time.
+- Independent regression re-review and scoped security-fix validation: passed with no remaining material finding in the reviewed surfaces.
+
+Live destructive Gmail mutations were intentionally not run against the maintainer's personal account. Disposable-account label/message/signature mutation coverage, Narrator/high-DPI interaction, WebView process-failure interaction, upgrade/rollback on a second machine, code signing, and clean-machine installation remain environmental validation work rather than claims made by this release.
 
 ## Upgrade behavior
 
-Existing `%LOCALAPPDATA%\GLook` settings, encrypted OAuth sessions, signatures, and SQLite cache are retained. The first v1.1.0 start may migrate older cache partitions into the stable per-account layout. No Gmail reconnection should be required for a valid retained session.
+Existing `%LOCALAPPDATA%\GLook` account settings, encrypted OAuth sessions, signatures, quota ledger, and SQLite cache are retained. Versioned cache-hydration markers invalidate older completion assumptions without deleting retained mail. Valid saved Gmail sessions should reconnect silently; browser OAuth remains limited to explicit Connect or Reauthorize actions.
 
-The release executable is self-contained and should be run directly; do not distribute the project's `bin` or `obj` folders.
+The release executable is self-contained and should be run directly. Do not distribute the project's `bin` or `obj` folders.

@@ -10,11 +10,14 @@ public sealed record NotificationDeliveryResult(
     AppNotificationSetting Setting,
     string Message);
 
+public sealed record NotificationActivationRequest(string? AccountEmail, string? ThreadId);
+
 public sealed class WindowsNotificationService : IDisposable
 {
     private const string NotificationIconResourceName = "GLook.NotificationIcon";
     private readonly AppNotificationManager manager = AppNotificationManager.Default;
     private bool isRegistered;
+    private NotificationActivationRequest? pendingActivation;
 
     public bool IsRegistered => isRegistered;
 
@@ -23,6 +26,15 @@ public sealed class WindowsNotificationService : IDisposable
     public AppNotificationSetting Setting => manager.Setting;
 
     public string StatusText => GetSettingMessage(Setting);
+
+    public event EventHandler<NotificationActivationRequest>? ActivationRequested;
+
+    public NotificationActivationRequest? TakePendingActivation()
+    {
+        var activation = pendingActivation;
+        pendingActivation = null;
+        return activation;
+    }
 
     public bool Register()
     {
@@ -150,7 +162,7 @@ public sealed class WindowsNotificationService : IDisposable
         isRegistered = false;
     }
 
-    private static void NotificationInvoked(
+    private void NotificationInvoked(
         AppNotificationManager sender,
         AppNotificationActivatedEventArgs args)
     {
@@ -159,7 +171,19 @@ public sealed class WindowsNotificationService : IDisposable
             return;
         }
 
-        app.MainWindow.DispatcherQueue.TryEnqueue(app.MainWindow.Activate);
+        args.Arguments.TryGetValue("account", out var accountEmail);
+        args.Arguments.TryGetValue("threadId", out var threadId);
+        var activation = new NotificationActivationRequest(accountEmail, threadId);
+        pendingActivation = activation;
+        app.MainWindow.DispatcherQueue.TryEnqueue(() =>
+        {
+            app.MainWindow.Activate();
+            if (ActivationRequested is { } handler)
+            {
+                pendingActivation = null;
+                handler.Invoke(this, activation);
+            }
+        });
     }
 
     private static string GetSettingMessage(AppNotificationSetting setting) => setting switch

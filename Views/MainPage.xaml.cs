@@ -14,6 +14,7 @@ using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Data;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
+using Windows.ApplicationModel.DataTransfer;
 using Windows.Storage.Pickers;
 using WinRT.Interop;
 
@@ -36,6 +37,9 @@ public sealed partial class MainPage : Page
     private const double MinimumReadingPaneWidth = 340;
     private const double MinimumMessageListHeight = 190;
     private const double MinimumReadingPaneHeight = 240;
+    private const double DefaultFolderWidth = 252;
+    private const double DefaultMessageListWidth = 390;
+    private const double DefaultMessageListHeight = 330;
     private bool isCompact;
     private bool composeDialogOpen;
     private bool autoSyncInProgress;
@@ -65,6 +69,8 @@ public sealed partial class MainPage : Page
     private string? renderedThreadId;
     private readonly HashSet<string> collapsedThreadGroups = new(StringComparer.Ordinal);
     private readonly HashSet<string> selectedThreadIds = new(StringComparer.Ordinal);
+    private IReadOnlyList<string> draggedThreadIds = [];
+    private string? threadDragToken;
     private readonly ObservableCollection<MailThreadSummary> threadItems = [];
     private readonly ObservableCollection<MailThreadGroup> threadGroups = [];
     private readonly CollectionViewSource threadGroupsSource = new() { IsSourceGrouped = true };
@@ -126,6 +132,12 @@ public sealed partial class MainPage : Page
 
     private async void Page_Loaded(object sender, RoutedEventArgs e)
     {
+        if (Application.Current is App { NotificationService: { } notifications })
+        {
+            notifications.ActivationRequested -= NotificationService_ActivationRequested;
+            notifications.ActivationRequested += NotificationService_ActivationRequested;
+        }
+
         StartQuotaDisplayTimer();
         await InitializeAccountsAsync();
         await InitializeBoardAsync();
@@ -133,15 +145,77 @@ public sealed partial class MainPage : Page
         SyncFolderTree();
         await PublishHistoryNotificationsAsync(ViewModel, activeAccountId);
         StartAutoSyncTimer();
+        if (Application.Current is App { NotificationService: { } notificationService }
+            && notificationService.TakePendingActivation() is { } pendingActivation)
+        {
+            await OpenNotificationConversationAsync(pendingActivation);
+        }
     }
 
     private void Page_Unloaded(object sender, RoutedEventArgs e)
     {
+        if (Application.Current is App { NotificationService: { } notifications })
+        {
+            notifications.ActivationRequested -= NotificationService_ActivationRequested;
+        }
+
         autoSyncTimer?.Stop();
         autoSyncTimer = null;
         quotaDisplayTimer?.Stop();
         quotaDisplayTimer = null;
+        CloseMessageWebView();
         SaveUiSettings();
+    }
+
+    private async void NotificationService_ActivationRequested(
+        object? sender,
+        NotificationActivationRequest activation)
+    {
+        await OpenNotificationConversationAsync(activation);
+    }
+
+    private async Task OpenNotificationConversationAsync(NotificationActivationRequest activation)
+    {
+        if (string.IsNullOrWhiteSpace(activation.ThreadId))
+        {
+            return;
+        }
+
+        try
+        {
+            await RefreshConnectedAccountsAsync();
+            var account = connectedAccounts.FirstOrDefault(candidate =>
+                string.Equals(candidate.EmailAddress, activation.AccountEmail, StringComparison.OrdinalIgnoreCase));
+            if (account is not null && activeAccountId != account.AccountId)
+            {
+                await SwitchToAccountAsync(account.AccountId, initialize: true);
+            }
+
+            if (activeAccountId is not Guid accountId)
+            {
+                return;
+            }
+
+            var session = await accountCoordinator.GetSessionAsync(accountId);
+            var thread = ViewModel.Threads.FirstOrDefault(candidate => candidate.Id == activation.ThreadId)
+                ?? await session.MailStore.LoadThreadAsync(activation.ThreadId);
+            if (thread is null)
+            {
+                ViewModel.SyncStatusText = "Conversation is not cached yet";
+                ViewModel.SyncStatusDetail = "Sync the mailbox, then open the notification again.";
+                return;
+            }
+
+            await ViewModel.SelectThreadAsync(thread);
+            SetMailViewMode(MailViewMode.List);
+            ApplyRealizedThreadPresentation();
+            UpdateContentPanels();
+        }
+        catch (Exception ex)
+        {
+            ViewModel.SyncStatusText = "Could not open notification";
+            ViewModel.SyncStatusDetail = ex.GetBaseException().Message;
+        }
     }
 
     private void StartQuotaDisplayTimer()
@@ -316,7 +390,7 @@ public sealed partial class MainPage : Page
         var accountId = Guid.NewGuid();
         var credentialDirectory = accountCoordinator.Registry.GetCredentialDirectory(accountId);
         Directory.CreateDirectory(credentialDirectory);
-        foreach (var sourcePath in Directory.EnumerateFiles(legacySecurePath, "*.bin", SearchOption.TopDirectoryOnly))
+        foreach (var sourcePath in GmailAccountSessionCoordinator.EnumerateCredentialFiles(legacySecurePath))
         {
             var destinationPath = Path.Combine(credentialDirectory, Path.GetFileName(sourcePath));
             File.Copy(sourcePath, destinationPath, overwrite: false);
@@ -1057,7 +1131,135 @@ public sealed partial class MainPage : Page
         if (e.ClickedItem is MailThreadSummary thread)
         {
             await ViewModel.SelectThreadAsync(thread);
+            ApplyRealizedThreadPresentation();
+            SyncFolderTree();
+            UpdateContentPanels();
         }
+    }
+
+    private void ThreadList_DragItemsStarting(object sender, DragItemsStartingEventArgs e)
+    {
+        var anchor = e.Items.OfType<MailThreadSummary>().FirstOrDefault();
+        if (anchor is null || activeAccountId is null)
+        {
+            e.Cancel = true;
+            return;
+        }
+
+        draggedThreadIds = selectedThreadIds.Contains(anchor.Id)
+            ? ViewModel.Threads
+                .Where(thread => selectedThreadIds.Contains(thread.Id))
+                .Select(thread => thread.Id)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray()
+            : [anchor.Id];
+        if (draggedThreadIds.Count == 0)
+        {
+            e.Cancel = true;
+            return;
+        }
+
+        threadDragToken = $"glook-mail-drag:{activeAccountId:D}:{Guid.NewGuid():N}";
+        e.Data.SetText($"{threadDragToken}\n{string.Join('\n', draggedThreadIds)}");
+        e.Data.RequestedOperation = DataPackageOperation.Move;
+    }
+
+    private void ThreadList_DragItemsCompleted(ListViewBase sender, DragItemsCompletedEventArgs args)
+    {
+        draggedThreadIds = [];
+        threadDragToken = null;
+    }
+
+    private void FolderTree_DragOver(object sender, DragEventArgs e)
+    {
+        if (draggedThreadIds.Count == 0
+            || threadDragToken is null
+            || !e.DataView.Contains(StandardDataFormats.Text)
+            || GetFolderDropTarget(e) is not { } target)
+        {
+            e.AcceptedOperation = DataPackageOperation.None;
+            return;
+        }
+
+        var addOnly = Convert.ToUInt32(e.Modifiers) == 1;
+        e.AcceptedOperation = addOnly ? DataPackageOperation.Copy : DataPackageOperation.Move;
+        e.DragUIOverride.Caption = addOnly
+            ? $"Add label {target.Folder!.FullName}"
+            : $"Move to {target.Folder!.FullName}";
+        e.DragUIOverride.IsCaptionVisible = true;
+    }
+
+    private async void FolderTree_Drop(object sender, DragEventArgs e)
+    {
+        var target = GetFolderDropTarget(e);
+        var threadIds = draggedThreadIds;
+        var expectedToken = threadDragToken;
+        if (target?.Folder is not { } folder
+            || threadIds.Count == 0
+            || expectedToken is null
+            || !e.DataView.Contains(StandardDataFormats.Text))
+        {
+            e.AcceptedOperation = DataPackageOperation.None;
+            return;
+        }
+
+        var payload = await e.DataView.GetTextAsync();
+        if (!payload.StartsWith($"{expectedToken}\n", StringComparison.Ordinal))
+        {
+            e.AcceptedOperation = DataPackageOperation.None;
+            return;
+        }
+
+        var threads = ViewModel.Threads
+            .Where(thread => threadIds.Contains(thread.Id, StringComparer.Ordinal))
+            .ToArray();
+        if (threads.Length == 0)
+        {
+            e.AcceptedOperation = DataPackageOperation.None;
+            return;
+        }
+
+        var addOnly = Convert.ToUInt32(e.Modifiers) == 1;
+        try
+        {
+            if (addOnly)
+            {
+                await ViewModel.AddLabelToThreadsAsync(threads, folder);
+            }
+            else
+            {
+                await ViewModel.MoveThreadsAsync(threads, folder);
+            }
+
+            e.AcceptedOperation = addOnly ? DataPackageOperation.Copy : DataPackageOperation.Move;
+            ClearThreadSelectionState(clearReadingPane: false);
+            SyncFolderTree();
+            UpdateContentPanels();
+        }
+        catch (Exception ex)
+        {
+            e.AcceptedOperation = DataPackageOperation.None;
+            await ShowMessageAsync("Conversation was not moved", ex.GetBaseException().Message);
+        }
+        finally
+        {
+            draggedThreadIds = [];
+            threadDragToken = null;
+        }
+    }
+
+    private FolderTreeItem? GetFolderDropTarget(DragEventArgs e)
+    {
+        var container = FindAncestor<TreeViewItem>(e.OriginalSource as DependencyObject);
+        var node = container is null ? null : FolderTree.NodeFromContainer(container);
+        if (node?.Content is not FolderTreeItem { Folder: { } folder } item
+            || item.AccountId != activeAccountId
+            || (!folder.CanDelete && !string.Equals(folder.Id, "INBOX", StringComparison.Ordinal)))
+        {
+            return null;
+        }
+
+        return item;
     }
 
     private void ThreadSelectionCheckBox_Checked(object sender, RoutedEventArgs e)
@@ -1401,76 +1603,12 @@ public sealed partial class MainPage : Page
             SyncFolderTree();
             await UpdateBoardMailboxesAsync();
         };
-        accountsView.AddAccountRequested += async (_, _) =>
-        {
-            try
-            {
-                var added = await accountCoordinator.AddAccountAsync();
-                await accountsView.RefreshAsync();
-                await RefreshConnectedAccountsAsync();
-                await SwitchToAccountAsync(added.AccountId, initialize: true);
-                await UpdateBoardMailboxesAsync();
-                await EnsureInboxBoardBindingsAsync();
-            }
-            catch (Exception ex)
-            {
-                accountsView.AnnounceError("Could not add Gmail account", ex.GetBaseException().Message);
-            }
-        };
-        accountsView.ReauthorizeAccountRequested += async (_, args) =>
-        {
-            try
-            {
-                var session = await accountCoordinator.GetSessionAsync(args.Account.AccountId);
-                _ = await session.Gmail.ReauthorizeAsync(args.Account.EmailAddress);
-
-                await accountCoordinator.UpdateAccountSyncStatusAsync(
-                    args.Account.AccountId,
-                    GmailAccountSyncState.Ready,
-                    args.Account.LastSuccessfulSyncAt,
-                    lastSyncError: null);
-                if (activeAccountId == args.Account.AccountId)
-                {
-                    await SwitchToAccountAsync(args.Account.AccountId, initialize: true);
-                }
-
-                await accountsView.RefreshAsync();
-            }
-            catch (Exception ex)
-            {
-                accountsView.AnnounceError("Gmail reauthorization failed", ex.GetBaseException().Message);
-            }
-        };
-        accountsView.RemoveAccountRequested += async (_, args) =>
-        {
-            try
-            {
-                var removingActive = activeAccountId == args.Account.AccountId;
-                await accountCoordinator.RemoveAccountAsync(args.Account.AccountId);
-                accountFolderSnapshots.Remove(args.Account.AccountId);
-                initializedMailboxTrees.Remove(args.Account.AccountId);
-                await RefreshConnectedAccountsAsync();
-                if (removingActive)
-                {
-                    if (connectedAccounts.Count > 0)
-                    {
-                        await SwitchToAccountAsync(connectedAccounts[0].AccountId, initialize: true);
-                    }
-                    else
-                    {
-                        SwitchToDisconnectedViewModel();
-                    }
-                }
-
-                await accountsView.RefreshAsync();
-                await UpdateBoardMailboxesAsync();
-                SyncFolderTree();
-            }
-            catch (Exception ex)
-            {
-                accountsView.AnnounceError("Could not remove Gmail account", ex.GetBaseException().Message);
-            }
-        };
+        accountsView.AddAccountRequested += (_, args) =>
+            args.Completion = AddAccountFromSettingsAsync(accountsView);
+        accountsView.ReauthorizeAccountRequested += (_, args) =>
+            args.Completion = ReauthorizeAccountFromSettingsAsync(accountsView, args.Account);
+        accountsView.RemoveAccountRequested += (_, args) =>
+            args.Completion = RemoveAccountFromSettingsAsync(accountsView, args.Account);
 
         var dialog = new ContentDialog
         {
@@ -1480,7 +1618,106 @@ public sealed partial class MainPage : Page
             CloseButtonText = "Done",
             DefaultButton = ContentDialogButton.Close
         };
+        dialog.Closing += async (_, args) =>
+        {
+            var deferral = args.GetDeferral();
+            try
+            {
+                args.Cancel = !await accountsView.SavePendingChangesAsync();
+            }
+            finally
+            {
+                deferral.Complete();
+            }
+        };
         await dialog.ShowAsync();
+    }
+
+    private async Task AddAccountFromSettingsAsync(AccountsSettingsView accountsView)
+    {
+        try
+        {
+            var added = await accountCoordinator.AddAccountAsync();
+            await accountsView.RefreshAsync();
+            await RefreshConnectedAccountsAsync();
+            await SwitchToAccountAsync(added.AccountId, initialize: true);
+            await UpdateBoardMailboxesAsync();
+            await EnsureInboxBoardBindingsAsync();
+        }
+        catch (Exception ex)
+        {
+            accountsView.AnnounceError("Could not add Gmail account", ex.GetBaseException().Message);
+        }
+    }
+
+    private async Task ReauthorizeAccountFromSettingsAsync(
+        AccountsSettingsView accountsView,
+        GmailAccountRegistration account)
+    {
+        try
+        {
+            var session = await accountCoordinator.GetSessionAsync(account.AccountId);
+            await session.OperationGate.WaitAsync();
+            await session.ConnectionGate.WaitAsync();
+            try
+            {
+                _ = await session.Gmail.ReauthorizeAsync(account.EmailAddress);
+            }
+            finally
+            {
+                session.ConnectionGate.Release();
+                session.OperationGate.Release();
+            }
+
+            await accountCoordinator.UpdateAccountSyncStatusAsync(
+                account.AccountId,
+                GmailAccountSyncState.Ready,
+                account.LastSuccessfulSyncAt,
+                lastSyncError: null);
+            if (activeAccountId == account.AccountId)
+            {
+                await SwitchToAccountAsync(account.AccountId, initialize: true);
+            }
+
+            await accountsView.RefreshAsync();
+        }
+        catch (Exception ex)
+        {
+            accountsView.AnnounceError("Gmail reauthorization failed", ex.GetBaseException().Message);
+        }
+    }
+
+    private async Task RemoveAccountFromSettingsAsync(
+        AccountsSettingsView accountsView,
+        GmailAccountRegistration account)
+    {
+        try
+        {
+            var removingActive = activeAccountId == account.AccountId;
+            await accountCoordinator.RemoveAccountAsync(account.AccountId);
+            accountFolderSnapshots.Remove(account.AccountId);
+            initializedMailboxTrees.Remove(account.AccountId);
+            await RefreshConnectedAccountsAsync();
+            if (removingActive)
+            {
+                if (connectedAccounts.Count > 0)
+                {
+                    await SwitchToAccountAsync(connectedAccounts[0].AccountId, initialize: true);
+                }
+                else
+                {
+                    SwitchToDisconnectedViewModel();
+                }
+            }
+
+            await accountsView.RefreshAsync();
+            await UpdateBoardMailboxesAsync();
+            SyncFolderTree();
+        }
+        catch (Exception ex)
+        {
+            accountsView.AnnounceError("Could not remove Gmail account", ex.GetBaseException().Message);
+        }
     }
 
     private void SwitchToDisconnectedViewModel()
@@ -1585,6 +1822,35 @@ public sealed partial class MainPage : Page
             await Windows.System.Launcher.LaunchUriAsync(new Uri("ms-settings:notifications"));
         };
 
+        var diagnosticsStatus = new TextBlock { TextWrapping = TextWrapping.Wrap };
+        var exportDiagnosticsButton = new Button
+        {
+            Content = "Export diagnostics",
+            HorizontalAlignment = HorizontalAlignment.Left
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(
+            exportDiagnosticsButton,
+            "Export privacy-safe GLook diagnostics");
+        exportDiagnosticsButton.Click += async (_, _) =>
+        {
+            exportDiagnosticsButton.IsEnabled = false;
+            diagnosticsStatus.Text = "Creating diagnostics…";
+            try
+            {
+                var path = await ExportDiagnosticsAsync();
+                diagnosticsStatus.Text = $"Saved diagnostics to {path}. No OAuth tokens or message bodies are included.";
+                await Windows.System.Launcher.LaunchFolderPathAsync(Path.GetDirectoryName(path)!);
+            }
+            catch (Exception ex)
+            {
+                diagnosticsStatus.Text = $"Diagnostics could not be exported: {ex.GetBaseException().Message}";
+            }
+            finally
+            {
+                exportDiagnosticsButton.IsEnabled = true;
+            }
+        };
+
         var syncSection = new StackPanel { Spacing = 8 };
         syncSection.Children.Add(new TextBlock
         {
@@ -1630,6 +1896,21 @@ public sealed partial class MainPage : Page
         notificationSection.Children.Add(testNotificationButton);
         notificationSection.Children.Add(windowsSettingsButton);
 
+        var diagnosticsSection = new StackPanel { Spacing = 8 };
+        diagnosticsSection.Children.Add(new TextBlock
+        {
+            Text = "DIAGNOSTICS",
+            FontSize = 12,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold
+        });
+        diagnosticsSection.Children.Add(new TextBlock
+        {
+            Text = "Export sync cursors, cache counts, account states, and estimated Gmail API use. OAuth tokens and email content are excluded.",
+            TextWrapping = TextWrapping.Wrap
+        });
+        diagnosticsSection.Children.Add(exportDiagnosticsButton);
+        diagnosticsSection.Children.Add(diagnosticsStatus);
+
         var content = new StackPanel
         {
             MaxWidth = 460,
@@ -1638,6 +1919,7 @@ public sealed partial class MainPage : Page
         content.Children.Add(syncSection);
         content.Children.Add(privacySection);
         content.Children.Add(notificationSection);
+        content.Children.Add(diagnosticsSection);
 
         var dialog = new ContentDialog
         {
@@ -2293,6 +2575,70 @@ public sealed partial class MainPage : Page
     }
 
     private void FolderResizeThumb_DragCompleted(object sender, DragCompletedEventArgs e) => SaveUiSettings();
+
+    private void ResizeThumb_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        const double step = 16;
+        if (ReferenceEquals(sender, MessageResizeThumb))
+        {
+            var delta = e.Key switch
+            {
+                Windows.System.VirtualKey.Left when readingPaneMode == ReadingPaneMode.Right => -step,
+                Windows.System.VirtualKey.Right when readingPaneMode == ReadingPaneMode.Right => step,
+                Windows.System.VirtualKey.Up when readingPaneMode == ReadingPaneMode.Bottom => -step,
+                Windows.System.VirtualKey.Down when readingPaneMode == ReadingPaneMode.Bottom => step,
+                _ => 0
+            };
+            if (delta == 0)
+            {
+                return;
+            }
+
+            MessageResizeThumb_DragDelta(
+                sender,
+                new DragDeltaEventArgs(
+                    readingPaneMode == ReadingPaneMode.Right ? delta : 0,
+                    readingPaneMode == ReadingPaneMode.Bottom ? delta : 0));
+        }
+        else
+        {
+            var delta = e.Key switch
+            {
+                Windows.System.VirtualKey.Left => -step,
+                Windows.System.VirtualKey.Right => step,
+                _ => 0
+            };
+            if (delta == 0)
+            {
+                return;
+            }
+
+            FolderSplitView.OpenPaneLength = Math.Clamp(
+                FolderSplitView.OpenPaneLength + delta,
+                MinimumFolderWidth,
+                MaximumFolderWidth);
+        }
+
+        e.Handled = true;
+        SaveUiSettings();
+    }
+
+    private void ResizeThumb_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
+    {
+        if (ReferenceEquals(sender, MessageResizeThumb))
+        {
+            messageListWidth = DefaultMessageListWidth;
+            messageListHeight = DefaultMessageListHeight;
+            ApplyReadingLayout();
+        }
+        else
+        {
+            FolderSplitView.OpenPaneLength = DefaultFolderWidth;
+        }
+
+        e.Handled = true;
+        SaveUiSettings();
+    }
 
     private void ResizeThumb_PointerEntered(object sender, PointerRoutedEventArgs e) =>
         ApplyResizePointer(sender);
@@ -2966,7 +3312,14 @@ public sealed partial class MainPage : Page
                     : Visibility.Collapsed;
             MessageTextFallback.Visibility = Visibility.Collapsed;
             MessageWebView.Visibility = Visibility.Visible;
-            messageDocumentHtml = MailHtmlRenderer.BuildDocument(detail, allowRemoteContent);
+            messageDocumentHtml = await Task.Run(
+                () => MailHtmlRenderer.BuildDocument(detail, allowRemoteContent));
+            if (renderVersion != messageRenderVersion
+                || ViewModel.SelectedThreadDetail?.Id != detail.Id)
+            {
+                return;
+            }
+
             messageDocumentUri = $"{MessageDocumentOrigin}conversation/{Uri.EscapeDataString(detail.Id)}?render={renderVersion}";
             messageNavigationId = null;
             MessageWebView.CoreWebView2.Navigate(messageDocumentUri);
@@ -2999,6 +3352,35 @@ public sealed partial class MainPage : Page
         MessageWebView.CoreWebView2.NavigationStarting += MessageWebView_NavigationStarting;
         MessageWebView.CoreWebView2.NavigationCompleted += MessageWebView_NavigationCompleted;
         MessageWebView.CoreWebView2.NewWindowRequested += MessageWebView_NewWindowRequested;
+        MessageWebView.CoreWebView2.ProcessFailed += MessageWebView_ProcessFailed;
+    }
+
+    private void MessageWebView_ProcessFailed(
+        CoreWebView2 sender,
+        CoreWebView2ProcessFailedEventArgs args)
+    {
+        if (ViewModel.SelectedThreadDetail is { } detail)
+        {
+            ShowMessageTextFallback(detail, $"The protected reading process stopped ({args.ProcessFailedKind}).");
+        }
+    }
+
+    private void CloseMessageWebView()
+    {
+        if (MessageWebView.CoreWebView2 is { } core)
+        {
+            core.WebResourceRequested -= MessageWebView_WebResourceRequested;
+            core.NavigationStarting -= MessageWebView_NavigationStarting;
+            core.NavigationCompleted -= MessageWebView_NavigationCompleted;
+            core.NewWindowRequested -= MessageWebView_NewWindowRequested;
+            core.ProcessFailed -= MessageWebView_ProcessFailed;
+        }
+
+        MessageWebView.Close();
+        messageWebViewInitializationTask = null;
+        messageDocumentHtml = null;
+        messageDocumentUri = null;
+        messageNavigationId = null;
     }
 
     private void MessageWebView_WebResourceRequested(
@@ -3500,7 +3882,7 @@ public sealed partial class MainPage : Page
 
     private void Delete_AcceleratorInvoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
     {
-        if (ViewModel.SelectedThread is null)
+        if (SelectedThreadsForAction().Count == 0)
         {
             return;
         }
@@ -3569,10 +3951,13 @@ public sealed partial class MainPage : Page
                 .Where(account => !showProgress ? account.AutomaticSyncEnabled : true)
                 .OrderBy(account => account.SortOrder)
                 .ToArray();
-            if (accounts.Length == 0 && ViewModel.IsConnected)
+            if (accounts.Length == 0)
             {
-                await ViewModel.RefreshAsync(cancellationToken);
-                await PublishHistoryNotificationsAsync(ViewModel, activeAccountId);
+                if (showProgress)
+                {
+                    ViewModel.SyncStatusText = "No mailboxes to sync";
+                    ViewModel.SyncStatusDetail = "No connected Gmail accounts are available.";
+                }
                 return;
             }
 
@@ -3596,7 +3981,9 @@ public sealed partial class MainPage : Page
                     if (account.AccountId == activeAccountId)
                     {
                         syncViewModel = ViewModel;
-                        await syncViewModel.RefreshAsync(cancellationToken);
+                        await syncViewModel.RefreshAsync(
+                            cancellationToken,
+                            hydrateSelectedFolder: showProgress);
                     }
                     else
                     {
@@ -3669,19 +4056,60 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private Task PublishHistoryNotificationsAsync(MainViewModel source, Guid? accountId)
+    private async Task<string> ExportDiagnosticsAsync()
+    {
+        await RefreshConnectedAccountsAsync();
+        var accounts = new List<object>(connectedAccounts.Count);
+        foreach (var registration in connectedAccounts)
+        {
+            var session = await accountCoordinator.GetSessionAsync(registration.AccountId);
+            accounts.Add(new
+            {
+                registration.AccountId,
+                registration.SyncState,
+                registration.AutomaticSyncEnabled,
+                registration.NotificationsEnabled,
+                registration.LastSuccessfulSyncAt,
+                registration.LastSyncError,
+                HistoryCursor = await session.MailStore.GetHistoryCursorAsync(),
+                CachedThreadCount = await session.MailStore.GetCachedThreadCountAsync(),
+                CachedFolderCount = (await session.MailStore.LoadFoldersAsync()).Count,
+                HydratedFolderCount = (await session.MailStore.LoadHydratedFolderIdsAsync()).Count,
+                Quota = session.Gmail.QuotaSnapshot
+            });
+        }
+
+        var diagnostics = new
+        {
+            GeneratedAt = DateTimeOffset.Now,
+            AppVersion = typeof(MainPage).Assembly.GetName().Version?.ToString(),
+            ActiveAccountId = activeAccountId,
+            AutoSyncEnabled = autoSyncEnabled,
+            AutoSyncIntervalMinutes = autoSyncIntervalMinutes,
+            Accounts = accounts
+        };
+        var directory = Path.Combine(appDataPath, "diagnostics");
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, $"glook-diagnostics-{DateTime.Now:yyyyMMdd-HHmmss}.json");
+        await File.WriteAllTextAsync(
+            path,
+            JsonSerializer.Serialize(diagnostics, new JsonSerializerOptions { WriteIndented = true }));
+        return path;
+    }
+
+    private async Task PublishHistoryNotificationsAsync(MainViewModel source, Guid? accountId)
     {
         if (Application.Current is not App app || app.NotificationService is null)
         {
-            return Task.CompletedTask;
+            return;
         }
 
         var account = accountId is Guid id
-            ? connectedAccounts.FirstOrDefault(candidate => candidate.AccountId == id)
+            ? await accountCoordinator.Registry.GetAccountAsync(id)
             : null;
-        if (account is { NotificationsEnabled: false })
+        if (!AccountNotificationPolicy.ShouldPublish(accountId, account))
         {
-            return Task.CompletedTask;
+            return;
         }
 
         foreach (var thread in source.LastSyncNotificationCandidates
@@ -3690,8 +4118,6 @@ public sealed partial class MainPage : Page
         {
             app.NotificationService.ShowNewMail(thread, account?.EmailAddress);
         }
-
-        return Task.CompletedTask;
     }
 
     private async Task ShowMessageAsync(string title, string message)

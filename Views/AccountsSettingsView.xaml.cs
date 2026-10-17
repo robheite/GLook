@@ -10,6 +10,7 @@ public sealed partial class AccountsSettingsView : UserControl
 {
     private GmailAccountSessionCoordinator? coordinator;
     private bool isRefreshing;
+    private readonly HashSet<Task> pendingActions = [];
 
     public AccountsSettingsView()
     {
@@ -18,7 +19,7 @@ public sealed partial class AccountsSettingsView : UserControl
 
     public ObservableCollection<AccountSettingsItemViewModel> Accounts { get; } = [];
 
-    public event EventHandler? AddAccountRequested;
+    public event EventHandler<AsyncActionRequestedEventArgs>? AddAccountRequested;
 
     public event EventHandler<AccountActionRequestedEventArgs>? ReauthorizeAccountRequested;
 
@@ -115,10 +116,12 @@ public sealed partial class AccountsSettingsView : UserControl
         AccountStatusAnnouncement.Text = $"{title}: {message}";
     }
 
-    private void AddAccount_Click(object sender, RoutedEventArgs e)
+    private async void AddAccount_Click(object sender, RoutedEventArgs e)
     {
         AccountStatusAnnouncement.Text = "Add Gmail account requested.";
-        AddAccountRequested?.Invoke(this, EventArgs.Empty);
+        var args = new AsyncActionRequestedEventArgs();
+        AddAccountRequested?.Invoke(this, args);
+        await TrackActionAsync(args.Completion);
     }
 
     private async void DisplayName_LostFocus(object sender, RoutedEventArgs e)
@@ -129,10 +132,28 @@ public sealed partial class AccountsSettingsView : UserControl
         }
     }
 
-    private async void AccountPreference_Toggled(object sender, RoutedEventArgs e)
+    private async void AutomaticSync_Toggled(object sender, RoutedEventArgs e)
     {
-        if (!isRefreshing && sender is FrameworkElement { Tag: Guid accountId })
+        if (!isRefreshing
+            && sender is ToggleSwitch { Tag: Guid accountId } toggle
+            && FindAccount(accountId) is { } item)
         {
+            // Toggled can run before the TwoWay x:Bind source update. Copy the
+            // control value first so persistence never writes the prior state.
+            item.ApplyAutomaticSyncToggleValue(toggle.IsOn);
+            await PersistAccountAsync(accountId);
+        }
+    }
+
+    private async void Notifications_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (!isRefreshing
+            && sender is ToggleSwitch { Tag: Guid accountId } toggle
+            && FindAccount(accountId) is { } item)
+        {
+            // Keep each mailbox independent and avoid relying on WinUI event
+            // ordering between Toggled and the generated TwoWay binding.
+            item.ApplyNotificationsToggleValue(toggle.IsOn);
             await PersistAccountAsync(accountId);
         }
     }
@@ -153,7 +174,7 @@ public sealed partial class AccountsSettingsView : UserControl
         }
     }
 
-    private void Reauthorize_Click(object sender, RoutedEventArgs e)
+    private async void Reauthorize_Click(object sender, RoutedEventArgs e)
     {
         if (sender is not FrameworkElement { Tag: Guid accountId }
             || FindAccount(accountId) is not { } item)
@@ -162,9 +183,9 @@ public sealed partial class AccountsSettingsView : UserControl
         }
 
         AccountStatusAnnouncement.Text = $"Reauthorize requested for {item.DisplayName}.";
-        ReauthorizeAccountRequested?.Invoke(
-            this,
-            new AccountActionRequestedEventArgs(item.ToRegistration()));
+        var args = new AccountActionRequestedEventArgs(item.ToRegistration());
+        ReauthorizeAccountRequested?.Invoke(this, args);
+        await TrackActionAsync(args.Completion);
     }
 
     private async void Remove_Click(object sender, RoutedEventArgs e)
@@ -192,41 +213,95 @@ public sealed partial class AccountsSettingsView : UserControl
         }
 
         AccountStatusAnnouncement.Text = $"Remove confirmed for {item.DisplayName}.";
-        RemoveAccountRequested?.Invoke(
-            this,
-            new AccountActionRequestedEventArgs(item.ToRegistration()));
+        var args = new AccountActionRequestedEventArgs(item.ToRegistration());
+        RemoveAccountRequested?.Invoke(this, args);
+        await TrackActionAsync(args.Completion);
     }
 
-    private async Task PersistAccountAsync(Guid accountId)
+    public async Task<bool> SavePendingChangesAsync(CancellationToken cancellationToken = default)
+    {
+        while (pendingActions.Count > 0)
+        {
+            await Task.WhenAll(pendingActions.ToArray()).WaitAsync(cancellationToken);
+        }
+
+        var saved = true;
+        foreach (var item in Accounts.ToArray())
+        {
+            saved &= await PersistAccountAsync(item.AccountId, cancellationToken, announceSuccess: false);
+        }
+
+        if (saved)
+        {
+            AccountStatusAnnouncement.Text = "All account settings are saved.";
+        }
+
+        return saved;
+    }
+
+    private async Task TrackActionAsync(Task? action)
+    {
+        if (action is null)
+        {
+            return;
+        }
+
+        pendingActions.Add(action);
+        try
+        {
+            await action;
+        }
+        finally
+        {
+            pendingActions.Remove(action);
+        }
+    }
+
+    private async Task<bool> PersistAccountAsync(
+        Guid accountId,
+        CancellationToken cancellationToken = default,
+        bool announceSuccess = true)
     {
         var activeCoordinator = coordinator;
         var item = FindAccount(accountId);
         if (activeCoordinator is null || item is null)
         {
-            return;
+            return false;
         }
 
-        await item.SaveGate.WaitAsync();
+        await item.SaveGate.WaitAsync(cancellationToken);
         try
         {
             item.DisplayName = string.IsNullOrWhiteSpace(item.DisplayName)
                 ? item.EmailAddress
                 : item.DisplayName.Trim();
+            if (!item.HasEditableChanges)
+            {
+                return true;
+            }
+
             var registration = await activeCoordinator.UpdateAccountPreferencesAsync(
                 accountId,
                 item.DisplayName,
                 item.AutomaticSyncEnabled,
-                item.NotificationsEnabled);
+                item.NotificationsEnabled,
+                cancellationToken);
             item.AcceptRegistration(registration);
             AccountRegistrationChanged?.Invoke(
                 this,
                 new AccountRegistrationChangedEventArgs(registration));
-            AccountStatusAnnouncement.Text = $"Saved settings for {item.DisplayName}.";
+            if (announceSuccess)
+            {
+                AccountStatusAnnouncement.Text = $"Saved settings for {item.DisplayName}.";
+            }
+
+            return true;
         }
         catch (Exception ex)
         {
             ShowNotice("Account settings were not saved", ex.GetBaseException().Message, InfoBarSeverity.Error);
             AccountStatusAnnouncement.Text = $"Settings for {item.DisplayName} were not saved.";
+            return false;
         }
         finally
         {
@@ -324,6 +399,11 @@ public sealed class AccountSettingsItemViewModel : INotifyPropertyChanged
 
     internal GmailAccountRegistration Registration { get; private set; }
 
+    internal bool HasEditableChanges =>
+        !string.Equals(DisplayName, Registration.DisplayName, StringComparison.Ordinal)
+        || AutomaticSyncEnabled != Registration.AutomaticSyncEnabled
+        || NotificationsEnabled != Registration.NotificationsEnabled;
+
     public Guid AccountId => Registration.AccountId;
 
     public string EmailAddress => Registration.EmailAddress;
@@ -345,6 +425,10 @@ public sealed class AccountSettingsItemViewModel : INotifyPropertyChanged
         get => notificationsEnabled;
         set => SetField(ref notificationsEnabled, value);
     }
+
+    internal void ApplyAutomaticSyncToggleValue(bool isOn) => AutomaticSyncEnabled = isOn;
+
+    internal void ApplyNotificationsToggleValue(bool isOn) => NotificationsEnabled = isOn;
 
     public string SyncStatusText
     {
@@ -395,10 +479,7 @@ public sealed class AccountSettingsItemViewModel : INotifyPropertyChanged
     public string RemoveAutomationName => $"Remove {DisplayName}";
 
     internal GmailAccountRegistration ToRegistration()
-    {
-        Registration = MergeEditableFields(Registration);
-        return Registration;
-    }
+        => MergeEditableFields(Registration);
 
     internal GmailAccountRegistration MergeEditableFields(GmailAccountRegistration registration) =>
         registration with
@@ -448,7 +529,7 @@ public sealed class AccountSettingsItemViewModel : INotifyPropertyChanged
     }
 
     private static string FormatQuotaStatus(GmailQuotaSnapshot quota) =>
-        $"Gmail API: {quota.RollingMinuteUnits:N0} of {GmailQuotaGovernor.UserUnitsPerMinute:N0} units in the rolling minute · background guard {quota.BackgroundMinuteBudget:N0} · {quota.EstimatedDailyUnits:N0} estimated today · {quota.State}";
+        $"Gmail API local estimate: {quota.RollingMinuteUnits:N0} of {GmailQuotaGovernor.UserUnitsPerMinute:N0} units in the rolling minute · background guard {quota.BackgroundMinuteBudget:N0} · {quota.EstimatedDailyUnits:N0} estimated over 24 hours · {quota.State}";
 
     private static string FormatLastSync(DateTimeOffset? lastSuccessfulSyncAt) =>
         lastSuccessfulSyncAt is null
@@ -495,6 +576,13 @@ public sealed class AccountActionRequestedEventArgs : EventArgs
     }
 
     public GmailAccountRegistration Account { get; }
+
+    public Task? Completion { get; set; }
+}
+
+public sealed class AsyncActionRequestedEventArgs : EventArgs
+{
+    public Task? Completion { get; set; }
 }
 
 public sealed class AccountRegistrationChangedEventArgs : EventArgs

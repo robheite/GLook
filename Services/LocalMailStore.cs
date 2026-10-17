@@ -8,6 +8,7 @@ namespace GLook.Services;
 
 public sealed class LocalMailStore
 {
+    private const int CurrentHydrationPolicyVersion = 1;
     private static readonly byte[] CacheEntropy = Encoding.UTF8.GetBytes("GLook.MailCache.v2");
     private readonly string databasePath;
     private readonly string connectionString;
@@ -164,15 +165,23 @@ public sealed class LocalMailStore
             var preferred = destinationFolders is null || sourceFolders.UpdatedAt > destinationFolders.UpdatedAt
                 ? sourceFolders
                 : destinationFolders;
-            var hydratedFolderIds = (sourceFolders.HydratedFolderIds ?? [])
-                .Concat(destinationFolders?.HydratedFolderIds ?? [])
+            var hydratedFolderIds = (sourceFolders.HydrationPolicyVersion == CurrentHydrationPolicyVersion
+                    ? sourceFolders.HydratedFolderIds ?? []
+                    : [])
+                .Concat(destinationFolders?.HydrationPolicyVersion == CurrentHydrationPolicyVersion
+                    ? destinationFolders.HydratedFolderIds ?? []
+                    : [])
                 .Distinct(StringComparer.Ordinal)
                 .ToArray();
             await UpsertFolderSnapshotAsync(
                 connection,
                 transaction,
                 destinationHash,
-                preferred with { HydratedFolderIds = hydratedFolderIds });
+                preferred with
+                {
+                    HydratedFolderIds = hydratedFolderIds,
+                    HydrationPolicyVersion = CurrentHydrationPolicyVersion
+                });
         }
 
         await transaction.CommitAsync();
@@ -191,7 +200,10 @@ public sealed class LocalMailStore
                 .DistinctBy(folder => folder.Id, StringComparer.Ordinal)
                 .ToArray(),
             DateTimeOffset.UtcNow,
-            existing?.HydratedFolderIds ?? []);
+            existing?.HydrationPolicyVersion == CurrentHydrationPolicyVersion
+                ? existing.HydratedFolderIds ?? []
+                : [],
+            CurrentHydrationPolicyVersion);
         await UpsertFolderSnapshotAsync(connection, transaction: null, accountHash, snapshot);
     }
 
@@ -237,7 +249,9 @@ public sealed class LocalMailStore
             connection,
             transaction: null,
             HashAccountId(accountScope));
-        return snapshot?.HydratedFolderIds ?? [];
+        return snapshot?.HydrationPolicyVersion == CurrentHydrationPolicyVersion
+            ? snapshot.HydratedFolderIds ?? []
+            : [];
     }
 
     public async Task MarkFolderHydratedAsync(string labelId)
@@ -247,12 +261,15 @@ public sealed class LocalMailStore
         await using var connection = await OpenConnectionAsync();
         var snapshot = await ReadFolderSnapshotAsync(connection, transaction: null, accountHash);
         if (snapshot is null
-            || (snapshot.HydratedFolderIds?.Contains(labelId, StringComparer.Ordinal) ?? false))
+            || (snapshot.HydrationPolicyVersion == CurrentHydrationPolicyVersion
+                && (snapshot.HydratedFolderIds?.Contains(labelId, StringComparer.Ordinal) ?? false)))
         {
             return;
         }
 
-        var hydratedFolderIds = (snapshot.HydratedFolderIds ?? [])
+        var hydratedFolderIds = (snapshot.HydrationPolicyVersion == CurrentHydrationPolicyVersion
+                ? snapshot.HydratedFolderIds ?? []
+                : [])
             .Append(labelId)
             .Distinct(StringComparer.Ordinal)
             .ToArray();
@@ -260,7 +277,39 @@ public sealed class LocalMailStore
             connection,
             transaction: null,
             accountHash,
-            snapshot with { HydratedFolderIds = hydratedFolderIds });
+            snapshot with
+            {
+                HydratedFolderIds = hydratedFolderIds,
+                HydrationPolicyVersion = CurrentHydrationPolicyVersion
+            });
+    }
+
+    public async Task ClearHydratedFolderIdsAsync()
+    {
+        if (accountScope is null)
+        {
+            return;
+        }
+
+        var accountHash = HashAccountId(accountScope);
+        await using var connection = await OpenConnectionAsync();
+        var snapshot = await ReadFolderSnapshotAsync(connection, transaction: null, accountHash);
+        if (snapshot is null
+            || (snapshot.HydrationPolicyVersion == CurrentHydrationPolicyVersion
+                && (snapshot.HydratedFolderIds?.Length ?? 0) == 0))
+        {
+            return;
+        }
+
+        await UpsertFolderSnapshotAsync(
+            connection,
+            transaction: null,
+            accountHash,
+            snapshot with
+            {
+                HydratedFolderIds = [],
+                HydrationPolicyVersion = CurrentHydrationPolicyVersion
+            });
     }
 
     public async Task SaveThreadsAsync(IEnumerable<MailThreadSummary> threads)
@@ -369,7 +418,8 @@ public sealed class LocalMailStore
     public async Task SaveFolderSnapshotAsync(
         string labelId,
         IEnumerable<MailThreadSummary> threads,
-        bool reconcileMissing = true)
+        bool reconcileMissing = true,
+        DateTimeOffset? reconcileMissingOnOrAfter = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(labelId);
         var accountHash = CurrentAccountHash();
@@ -380,7 +430,7 @@ public sealed class LocalMailStore
 
         await using var connection = await OpenConnectionAsync();
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
-        var existing = reconcileMissing
+        var existing = reconcileMissing || reconcileMissingOnOrAfter is not null
             ? await ReadAccountRowsAsync(connection, transaction, accountHash)
             : [];
 
@@ -389,12 +439,14 @@ public sealed class LocalMailStore
             await UpsertThreadAsync(connection, transaction, accountHash, thread);
         }
 
-        if (reconcileMissing)
+        if (reconcileMissing || reconcileMissingOnOrAfter is not null)
         {
             foreach (var row in existing)
             {
                 if (snapshotHashes.Contains(row.ThreadHash)
-                    || !row.Thread.LabelIds.Contains(labelId, StringComparer.Ordinal))
+                    || !row.Thread.LabelIds.Contains(labelId, StringComparer.Ordinal)
+                    || (!reconcileMissing
+                        && row.Thread.ReceivedAt < reconcileMissingOnOrAfter!.Value))
                 {
                     continue;
                 }
@@ -438,6 +490,20 @@ public sealed class LocalMailStore
             .OrderByDescending(thread => thread.ReceivedAt)
             .Take(limit)
             .ToList();
+    }
+
+    public async Task<int> GetCachedThreadCountAsync()
+    {
+        if (accountScope is null)
+        {
+            return 0;
+        }
+
+        await using var connection = await OpenConnectionAsync();
+        var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM secure_mail_threads WHERE account_hash = $accountHash;";
+        command.Parameters.AddWithValue("$accountHash", HashAccountId(accountScope));
+        return Convert.ToInt32(await command.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture);
     }
 
     public async Task<MailThreadSummary?> LoadThreadAsync(string threadId)
@@ -902,5 +968,6 @@ public sealed class LocalMailStore
     private sealed record CachedFolderSnapshot(
         MailFolder[] Folders,
         DateTimeOffset UpdatedAt,
-        string[]? HydratedFolderIds = null);
+        string[]? HydratedFolderIds = null,
+        int HydrationPolicyVersion = 0);
 }

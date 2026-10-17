@@ -27,7 +27,7 @@ public static partial class MailHtmlRenderer
         html.Append("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"color-scheme\" content=\"light\">");
         html.Append("<meta http-equiv=\"Content-Security-Policy\" content=\"");
         html.Append(allowRemoteContent
-            ? "default-src 'none'; img-src data: https: http:; style-src 'unsafe-inline'; font-src data: https: http:; media-src 'none'; frame-src 'none'; object-src 'none'; form-action 'none'; connect-src 'none'"
+            ? "default-src 'none'; img-src data: https: http:; style-src 'unsafe-inline'; font-src data:; media-src 'none'; frame-src 'none'; object-src 'none'; form-action 'none'; connect-src 'none'"
             : "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; media-src 'none'; frame-src 'none'; object-src 'none'; form-action 'none'; connect-src 'none'");
         html.Append("\"><style>");
         html.Append("html,body{margin:0;padding:0;background:#fff;color:#202124;font:14px/1.55 'Segoe UI',Arial,sans-serif;overflow-wrap:anywhere}");

@@ -31,7 +31,7 @@
                         VerticalAlignment="Center" />
                     <ComboBox
                         x:Name="MailboxSelector"
-                        MinWidth="240"
+                        MinWidth="180"
                         MaxWidth="420"
                         AutomationProperties.HelpText="Choose which connected Gmail mailbox appears on this board"
                         AutomationProperties.Name="Board mailbox"

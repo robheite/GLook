@@ -120,7 +120,7 @@
                                         OffContent="Off"
                                         OnContent="On"
                                         Tag="{x:Bind AccountId}"
-                                        Toggled="AccountPreference_Toggled" />
+                                        Toggled="AutomaticSync_Toggled" />
                                     <ToggleSwitch
                                         Grid.Column="1"
                                         AutomationProperties.Name="{x:Bind NotificationsAutomationName, Mode=OneWay}"
@@ -129,7 +129,7 @@
                                         OffContent="Off"
                                         OnContent="On"
                                         Tag="{x:Bind AccountId}"
-                                        Toggled="AccountPreference_Toggled" />
+                                        Toggled="Notifications_Toggled" />
                                 </Grid>
 
                                 <Border
